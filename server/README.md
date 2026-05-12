@@ -18,7 +18,17 @@ The server listens on `0.0.0.0:8080` by default.
 - `GET /health` returns a basic health check.
 - `GET /commands/recent` returns recent transcripts kept in memory.
 - `POST /audio/command` accepts either WAV or raw PCM audio. Raw PCM may use a
-  normal `Content-Length` request or HTTP chunked transfer.
+  normal `Content-Length` request or HTTP chunked transfer. It returns a compact
+  device response:
+
+```json
+{
+  "ok": true,
+  "transcript": "test",
+  "display_text": "Ready.",
+  "tone": "success"
+}
+```
 
 For raw PCM, send:
 
@@ -31,3 +41,11 @@ X-Device-Id: waveshare-c6
 
 The current ElevenLabs STT call uses `POST https://api.elevenlabs.io/v1/speech-to-text`,
 `model_id=scribe_v2`, and a multipart `file` field.
+
+## Built-in Commands
+
+- `test` or `ping` returns `Ready.`
+- `status` returns `Server online.`
+- `help` returns a short command list.
+- `repeat ...` or `say ...` displays the spoken suffix.
+- Anything else displays `Heard: ...`.

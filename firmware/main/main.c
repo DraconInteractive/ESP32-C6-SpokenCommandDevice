@@ -116,6 +116,7 @@ static const char *TAG = "waveshare_c6";
 #define COMMAND_HTTP_RESPONSE_MAX 512
 #define COMMAND_TEXT_MAX 192
 #define HTTP_CHUNK_HEADER_MAX 16
+#define TONE_CHUNK_FRAMES 128
 #define WIFI_CONNECT_TIMEOUT_MS 12000
 #define WIFI_CONNECTED_BIT BIT(0)
 #define WIFI_FAIL_BIT BIT(1)
@@ -199,6 +200,7 @@ static i2s_chan_handle_t s_i2s_tx = NULL;
 static i2s_chan_handle_t s_i2s_rx = NULL;
 static int16_t s_audio_samples[AUDIO_RECV_SAMPLES * 2] = {0};
 static int16_t s_command_chunk[AUDIO_RECV_SAMPLES] = {0};
+static int16_t s_tone_chunk[TONE_CHUNK_FRAMES * 2] = {0};
 static char s_last_command_text[COMMAND_TEXT_MAX] = "Hold BOOT and speak.";
 static EventGroupHandle_t s_wifi_event_group = NULL;
 static int s_wifi_retry_count = 0;
@@ -1121,6 +1123,71 @@ static bool extract_json_string_field(const char *json, const char *field, char 
     return written > 0;
 }
 
+static esp_err_t play_square_tone(uint16_t frequency_hz, uint16_t duration_ms, int16_t amplitude)
+{
+    const int total_frames = (AUDIO_SAMPLE_RATE * duration_ms) / 1000;
+    const int half_period_frames = AUDIO_SAMPLE_RATE / (frequency_hz * 2);
+    int frame = 0;
+
+    ESP_RETURN_ON_FALSE(s_i2s_tx != NULL, ESP_ERR_INVALID_STATE, TAG, "I2S TX is unavailable");
+    ESP_RETURN_ON_FALSE(half_period_frames > 0, ESP_ERR_INVALID_ARG, TAG, "invalid tone frequency");
+
+    while (frame < total_frames) {
+        const int frames_this_chunk = (total_frames - frame) > TONE_CHUNK_FRAMES ? TONE_CHUNK_FRAMES : (total_frames - frame);
+        for (int i = 0; i < frames_this_chunk; ++i) {
+            int16_t sample = (((frame + i) / half_period_frames) % 2) == 0 ? amplitude : -amplitude;
+            s_tone_chunk[i * 2] = sample;
+            s_tone_chunk[i * 2 + 1] = sample;
+        }
+
+        size_t bytes_written = 0;
+        esp_err_t ret = i2s_channel_write(s_i2s_tx, s_tone_chunk, frames_this_chunk * 2 * sizeof(int16_t), &bytes_written, pdMS_TO_TICKS(1000));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Tone write skipped: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        frame += frames_this_chunk;
+    }
+    return ESP_OK;
+}
+
+static void play_silence(uint16_t duration_ms)
+{
+    const int total_frames = (AUDIO_SAMPLE_RATE * duration_ms) / 1000;
+    int frame = 0;
+
+    memset(s_tone_chunk, 0, sizeof(s_tone_chunk));
+    while (frame < total_frames) {
+        const int frames_this_chunk = (total_frames - frame) > TONE_CHUNK_FRAMES ? TONE_CHUNK_FRAMES : (total_frames - frame);
+        size_t bytes_written = 0;
+        if (i2s_channel_write(s_i2s_tx, s_tone_chunk, frames_this_chunk * 2 * sizeof(int16_t), &bytes_written, pdMS_TO_TICKS(1000)) != ESP_OK) {
+            return;
+        }
+        frame += frames_this_chunk;
+    }
+}
+
+static void play_device_tone(const char *tone)
+{
+    if (tone == NULL || tone[0] == '\0' || strcmp(tone, "none") == 0) {
+        return;
+    }
+
+    if (strcmp(tone, "success") == 0) {
+        (void)play_square_tone(880, 70, 5000);
+        play_silence(35);
+        (void)play_square_tone(1320, 90, 5000);
+        return;
+    }
+
+    if (strcmp(tone, "error") == 0) {
+        (void)play_square_tone(220, 180, 5500);
+        return;
+    }
+
+    ESP_LOGW(TAG, "Unknown response tone: %s", tone);
+}
+
 static esp_err_t write_all_http(esp_http_client_handle_t client, const char *data, int length)
 {
     int written = 0;
@@ -1224,14 +1291,27 @@ static esp_err_t stream_command_audio(esp_lcd_panel_handle_t panel)
         ESP_LOGI(TAG, "Command server status=%d response=%s", status, response.data);
         render_status_band(panel, status >= 200 && status < 300 ? rgb565(40, 185, 145) : rgb565(180, 50, 60));
         if (status >= 200 && status < 300) {
-            if (!extract_json_string_field(response.data, "text", s_last_command_text, sizeof(s_last_command_text))) {
+            char tone[16] = {0};
+            if (!extract_json_string_field(response.data, "display_text", s_last_command_text, sizeof(s_last_command_text)) &&
+                !extract_json_string_field(response.data, "transcript", s_last_command_text, sizeof(s_last_command_text)) &&
+                !extract_json_string_field(response.data, "text", s_last_command_text, sizeof(s_last_command_text))) {
                 strlcpy(s_last_command_text, "Command received.", sizeof(s_last_command_text));
             }
             render_wrapped_text(panel, s_last_command_text);
+            if (extract_json_string_field(response.data, "tone", tone, sizeof(tone))) {
+                play_device_tone(tone);
+            }
             ret = ESP_OK;
         } else {
+            char tone[16] = {0};
             strlcpy(s_last_command_text, "Upload failed.", sizeof(s_last_command_text));
+            extract_json_string_field(response.data, "display_text", s_last_command_text, sizeof(s_last_command_text));
             render_wrapped_text(panel, s_last_command_text);
+            if (extract_json_string_field(response.data, "tone", tone, sizeof(tone))) {
+                play_device_tone(tone);
+            } else {
+                play_device_tone("error");
+            }
             ret = ESP_FAIL;
         }
     } else {

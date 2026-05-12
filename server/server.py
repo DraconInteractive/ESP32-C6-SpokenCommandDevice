@@ -2,8 +2,8 @@
 """Local bridge server for ESP32 spoken-command audio.
 
 The ESP32 posts either WAV bytes or raw signed 16-bit little-endian PCM. The
-server wraps PCM as WAV, forwards it to ElevenLabs Speech to Text, and returns
-the transcript JSON to the caller.
+server wraps PCM as WAV, forwards it to ElevenLabs Speech to Text, interprets
+the transcript as a local command, and returns a compact device response.
 """
 
 from __future__ import annotations
@@ -136,6 +136,64 @@ def transcribe_with_elevenlabs(wav_bytes: bytes) -> dict[str, Any]:
         raise RuntimeError(f"ElevenLabs request failed: {exc.reason}") from exc
 
 
+def normalize_command_text(text: str) -> str:
+    return " ".join(text.strip().lower().split())
+
+
+def command_response(transcript_text: str) -> dict[str, Any]:
+    text = transcript_text.strip()
+    normalized = normalize_command_text(text)
+
+    if not text:
+        return {
+            "ok": False,
+            "transcript": "",
+            "display_text": "No speech heard.",
+            "tone": "error",
+        }
+
+    if normalized in {"test", "ping"}:
+        return {
+            "ok": True,
+            "transcript": text,
+            "display_text": "Ready.",
+            "tone": "success",
+        }
+
+    if normalized in {"help", "commands", "what can you do"}:
+        return {
+            "ok": True,
+            "transcript": text,
+            "display_text": "Commands: test, status, repeat.",
+            "tone": "success",
+        }
+
+    if normalized in {"status", "server status"}:
+        return {
+            "ok": True,
+            "transcript": text,
+            "display_text": "Server online.",
+            "tone": "success",
+        }
+
+    for prefix in ("repeat ", "say "):
+        if normalized.startswith(prefix):
+            display_text = text[len(prefix):].strip()
+            return {
+                "ok": bool(display_text),
+                "transcript": text,
+                "display_text": display_text or "Nothing to repeat.",
+                "tone": "success" if display_text else "error",
+            }
+
+    return {
+        "ok": True,
+        "transcript": text,
+        "display_text": f"Heard: {text}",
+        "tone": "success",
+    }
+
+
 class CommandHandler(BaseHTTPRequestHandler):
     server_version = "SpokenCommandServer/0.1"
 
@@ -169,18 +227,27 @@ class CommandHandler(BaseHTTPRequestHandler):
 
             started = time.monotonic()
             transcript = transcribe_with_elevenlabs(wav_bytes)
+            device_response = command_response(transcript.get("text", ""))
             record = {
                 "device_id": device_id,
                 "received_at": int(time.time()),
                 "duration_ms": int((time.monotonic() - started) * 1000),
-                "text": transcript.get("text", ""),
+                "text": device_response["transcript"],
+                "display_text": device_response["display_text"],
+                "tone": device_response["tone"],
                 "transcript": transcript,
             }
             RECENT_COMMANDS.append(record)
             del RECENT_COMMANDS[:-50]
-            json_response(self, 200, record)
+            json_response(self, 200, device_response)
         except Exception as exc:
-            json_response(self, 400, {"error": str(exc)})
+            json_response(self, 400, {
+                "ok": False,
+                "transcript": "",
+                "display_text": "Command failed.",
+                "tone": "error",
+                "error": str(exc),
+            })
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.address_string()} - {fmt % args}")
