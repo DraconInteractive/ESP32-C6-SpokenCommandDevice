@@ -25,8 +25,12 @@ The server listens on `0.0.0.0:8080` by default.
 {
   "ok": true,
   "transcript": "test",
+  "command": "test",
   "display_text": "Ready.",
-  "tone": "success"
+  "tone": "success",
+  "state": {
+    "muted": false
+  }
 }
 ```
 
@@ -47,7 +51,19 @@ The current ElevenLabs STT call uses `POST https://api.elevenlabs.io/v1/speech-t
 - `test` or `ping` returns `Ready.`
 - `status` returns `Server online.`
 - `help` returns a short command list.
+- `cancel` cancels a pending command prompt.
 - `mute` disables response tones for that device.
 - `unmute` enables response tones for that device.
 - `repeat ...` or `say ...` displays the spoken suffix.
+- `timer`, `set timer`, or `set a timer` asks for a duration if one was not
+  supplied. The next response from the same device completes the timer.
 - Anything else displays `Heard: ...`.
+
+Example timer exchange:
+
+```text
+User: set a timer
+Device: How long should the timer be?
+User: 5 minutes
+Device: Timer set: 5 min
+```

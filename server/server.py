@@ -11,11 +11,13 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import time
 import uuid
 import wave
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -28,6 +30,15 @@ MAX_AUDIO_BYTES = int(os.environ.get("COMMAND_SERVER_MAX_AUDIO_BYTES", str(4 * 1
 
 RECENT_COMMANDS: list[dict[str, Any]] = []
 MUTED_DEVICES: dict[str, bool] = {}
+PENDING_ACTIONS: dict[str, dict[str, Any]] = {}
+
+
+@dataclass(frozen=True)
+class Command:
+    name: str
+    aliases: tuple[str, ...]
+    description: str
+    handler: Callable[[str, str, str], dict[str, Any]]
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -141,10 +152,236 @@ def normalize_command_text(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 
+def base_response(ok: bool, transcript: str, display_text: str, tone: str = "success", command: str | None = None,
+                  state: dict[str, Any] | None = None) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "ok": ok,
+        "transcript": transcript,
+        "display_text": display_text,
+        "tone": tone,
+    }
+    if command is not None:
+        response["command"] = command
+    if state:
+        response["state"] = state
+    return response
+
+
 def apply_mute_state(device_id: str, response: dict[str, Any]) -> dict[str, Any]:
     if MUTED_DEVICES.get(device_id, False):
         response["tone"] = "none"
     return response
+
+
+def parse_duration_seconds(text: str) -> int | None:
+    normalized = normalize_command_text(text)
+    words = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "fifteen": 15,
+        "twenty": 20,
+        "thirty": 30,
+        "forty": 40,
+        "forty five": 45,
+        "sixty": 60,
+    }
+
+    for phrase, value in sorted(words.items(), key=lambda item: len(item[0]), reverse=True):
+        normalized = re.sub(rf"\b{re.escape(phrase)}\b", str(value), normalized)
+
+    match = re.search(r"\b(\d+)\s*(second|seconds|sec|secs)\b", normalized)
+    if match:
+        return int(match.group(1))
+
+    match = re.search(r"\b(\d+)\s*(minute|minutes|min|mins)\b", normalized)
+    if match:
+        return int(match.group(1)) * 60
+
+    match = re.search(r"\b(\d+)\s*(hour|hours|hr|hrs)\b", normalized)
+    if match:
+        return int(match.group(1)) * 3600
+
+    match = re.fullmatch(r"\d+", normalized)
+    if match:
+        return int(normalized) * 60
+
+    return None
+
+
+def format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} sec"
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} min"
+    minutes, sec = divmod(seconds, 60)
+    return f"{minutes} min {sec} sec"
+
+
+def timer_response(transcript: str, device_id: str, duration_text: str) -> dict[str, Any]:
+    seconds = parse_duration_seconds(duration_text)
+    if seconds is None or seconds <= 0:
+        PENDING_ACTIONS[device_id] = {
+            "command": "timer",
+            "slot": "duration",
+            "prompt": "How long should the timer be?",
+            "created_at": time.time(),
+        }
+        return apply_mute_state(device_id, base_response(
+            False,
+            transcript,
+            "How long should the timer be?",
+            "error",
+            command="timer",
+            state={"awaiting": "duration"},
+        ))
+
+    return apply_mute_state(device_id, base_response(
+        True,
+        transcript,
+        f"Timer set: {format_duration(seconds)}",
+        "success",
+        command="timer",
+        state={"duration_seconds": seconds, "expires_at": int(time.time() + seconds)},
+    ))
+
+
+def handle_pending_action(device_id: str, text: str, normalized: str) -> dict[str, Any] | None:
+    if normalized in {"cancel", "stop", "nevermind", "never mind"}:
+        PENDING_ACTIONS.pop(device_id, None)
+        return apply_mute_state(device_id, base_response(True, text, "Cancelled.", "success", command="cancel"))
+
+    pending = PENDING_ACTIONS.get(device_id)
+    if pending is None:
+        return None
+
+    if pending.get("command") == "timer" and pending.get("slot") == "duration":
+        response = timer_response(text, device_id, text)
+        if response.get("ok"):
+            PENDING_ACTIONS.pop(device_id, None)
+        return response
+
+    PENDING_ACTIONS.pop(device_id, None)
+    return apply_mute_state(device_id, base_response(False, text, "I lost that request.", "error"))
+
+
+def handle_mute(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+    MUTED_DEVICES[device_id] = True
+    return base_response(True, text, "Muted.", "none", command="mute", state={"muted": True})
+
+
+def handle_unmute(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+    MUTED_DEVICES[device_id] = False
+    return base_response(True, text, "Unmuted.", "success", command="unmute", state={"muted": False})
+
+
+def handle_test(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+    return apply_mute_state(device_id, base_response(True, text, "Ready.", "success", command="test"))
+
+
+def handle_help(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+    return apply_mute_state(device_id, base_response(
+        True,
+        text,
+        "Commands: test, status, mute, timer.",
+        "success",
+        command="help",
+    ))
+
+
+def handle_status(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+    muted = MUTED_DEVICES.get(device_id, False)
+    pending = PENDING_ACTIONS.get(device_id)
+    status = "Server online. "
+    status += "Muted." if muted else "Sound on."
+    if pending:
+        status += f" Awaiting {pending.get('slot', 'input')}."
+    return apply_mute_state(device_id, base_response(
+        True,
+        text,
+        status,
+        "success",
+        command="status",
+        state={"muted": muted, "pending": pending is not None},
+    ))
+
+
+def handle_cancel(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+    had_pending = device_id in PENDING_ACTIONS
+    PENDING_ACTIONS.pop(device_id, None)
+    return apply_mute_state(device_id, base_response(
+        True,
+        text,
+        "Cancelled." if had_pending else "Nothing to cancel.",
+        "success",
+        command="cancel",
+    ))
+
+
+def handle_repeat(text: str, device_id: str, remainder: str) -> dict[str, Any]:
+    display_text = remainder.strip()
+    return apply_mute_state(device_id, base_response(
+        bool(display_text),
+        text,
+        display_text or "Nothing to repeat.",
+        "success" if display_text else "error",
+        command="repeat",
+    ))
+
+
+def handle_timer(text: str, device_id: str, remainder: str) -> dict[str, Any]:
+    duration_text = remainder.strip()
+    if not duration_text:
+        PENDING_ACTIONS[device_id] = {
+            "command": "timer",
+            "slot": "duration",
+            "prompt": "How long should the timer be?",
+            "created_at": time.time(),
+        }
+        return apply_mute_state(device_id, base_response(
+            True,
+            text,
+            "How long should the timer be?",
+            "success",
+            command="timer",
+            state={"awaiting": "duration"},
+        ))
+    return timer_response(text, device_id, duration_text)
+
+
+COMMANDS: tuple[Command, ...] = (
+    Command("mute", ("mute",), "Disable response tones for this device.", handle_mute),
+    Command("unmute", ("unmute",), "Enable response tones for this device.", handle_unmute),
+    Command("test", ("test", "ping"), "Check that the command server is ready.", handle_test),
+    Command("help", ("help", "commands", "what can you do"), "Show available commands.", handle_help),
+    Command("status", ("status", "server status"), "Show server/device state.", handle_status),
+    Command("cancel", ("cancel", "stop", "nevermind", "never mind"), "Cancel a pending command.", handle_cancel),
+    Command("repeat", ("repeat", "say"), "Display the spoken suffix.", handle_repeat),
+    Command("timer", ("timer", "set timer", "set a timer", "start timer", "start a timer"), "Set a timer.", handle_timer),
+)
+
+
+def dispatch_command(text: str, device_id: str) -> dict[str, Any] | None:
+    normalized = normalize_command_text(text)
+    for command in COMMANDS:
+        for alias in sorted(command.aliases, key=len, reverse=True):
+            if normalized == alias:
+                return command.handler(text, device_id, "")
+            if normalized.startswith(f"{alias} "):
+                remainder = text[len(alias):].strip()
+                return command.handler(text, device_id, remainder)
+    return None
 
 
 def command_response(transcript_text: str, device_id: str = "unknown") -> dict[str, Any]:
@@ -152,72 +389,22 @@ def command_response(transcript_text: str, device_id: str = "unknown") -> dict[s
     normalized = normalize_command_text(text)
 
     if not text:
-        return apply_mute_state(device_id, {
-            "ok": False,
-            "transcript": "",
-            "display_text": "No speech heard.",
-            "tone": "error",
-        })
+        return apply_mute_state(device_id, base_response(False, "", "No speech heard.", "error"))
 
-    if normalized == "mute":
-        MUTED_DEVICES[device_id] = True
-        return {
-            "ok": True,
-            "transcript": text,
-            "display_text": "Muted.",
-            "tone": "none",
-        }
+    if normalized in {"mute", "unmute", "status", "server status", "help", "commands", "what can you do", "cancel", "stop", "nevermind", "never mind"}:
+        command = dispatch_command(text, device_id)
+        if command is not None:
+            return command
 
-    if normalized == "unmute":
-        MUTED_DEVICES[device_id] = False
-        return {
-            "ok": True,
-            "transcript": text,
-            "display_text": "Unmuted.",
-            "tone": "success",
-        }
+    pending_response = handle_pending_action(device_id, text, normalized)
+    if pending_response is not None:
+        return pending_response
 
-    if normalized in {"test", "ping"}:
-        return apply_mute_state(device_id, {
-            "ok": True,
-            "transcript": text,
-            "display_text": "Ready.",
-            "tone": "success",
-        })
+    command = dispatch_command(text, device_id)
+    if command is not None:
+        return command
 
-    if normalized in {"help", "commands", "what can you do"}:
-        return apply_mute_state(device_id, {
-            "ok": True,
-            "transcript": text,
-            "display_text": "Commands: test, status, mute, repeat.",
-            "tone": "success",
-        })
-
-    if normalized in {"status", "server status"}:
-        muted = MUTED_DEVICES.get(device_id, False)
-        return apply_mute_state(device_id, {
-            "ok": True,
-            "transcript": text,
-            "display_text": f"Server online. {'Muted.' if muted else 'Sound on.'}",
-            "tone": "success",
-        })
-
-    for prefix in ("repeat ", "say "):
-        if normalized.startswith(prefix):
-            display_text = text[len(prefix):].strip()
-            return apply_mute_state(device_id, {
-                "ok": bool(display_text),
-                "transcript": text,
-                "display_text": display_text or "Nothing to repeat.",
-                "tone": "success" if display_text else "error",
-            })
-
-    return apply_mute_state(device_id, {
-        "ok": True,
-        "transcript": text,
-        "display_text": f"Heard: {text}",
-        "tone": "success",
-    })
+    return apply_mute_state(device_id, base_response(True, text, f"Heard: {text}", "success", command="unknown"))
 
 
 class CommandHandler(BaseHTTPRequestHandler):
@@ -261,6 +448,8 @@ class CommandHandler(BaseHTTPRequestHandler):
                 "text": device_response["transcript"],
                 "display_text": device_response["display_text"],
                 "tone": device_response["tone"],
+                "command": device_response.get("command"),
+                "state": device_response.get("state", {}),
                 "muted": MUTED_DEVICES.get(device_id, False),
                 "transcript": transcript,
             }
