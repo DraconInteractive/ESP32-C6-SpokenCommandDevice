@@ -1,6 +1,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -79,9 +80,29 @@ static const char *TAG = "waveshare_c6";
 #define TCA9554_MIC_EN_BIT BIT(7)
 
 #define AXP2101_ADDR 0x34
+#define AXP2101_REG_STATUS1 0x00
+#define AXP2101_REG_STATUS2 0x01
+#define AXP2101_REG_ADC_CHANNEL_CTRL 0x30
+#define AXP2101_REG_ADC_BAT_H 0x34
+#define AXP2101_REG_ADC_BAT_L 0x35
+#define AXP2101_REG_ADC_VBUS_H 0x38
+#define AXP2101_REG_ADC_VBUS_L 0x39
+#define AXP2101_REG_ADC_VSYS_H 0x3A
+#define AXP2101_REG_ADC_VSYS_L 0x3B
 #define AXP2101_REG_INTEN2 0x41
 #define AXP2101_REG_INTSTS1 0x48
 #define AXP2101_REG_INTSTS2 0x49
+#define AXP2101_REG_BAT_PERCENT 0xA4
+#define AXP2101_ADC_ENABLE_BATT BIT(0)
+#define AXP2101_ADC_ENABLE_VBUS BIT(2)
+#define AXP2101_ADC_ENABLE_VSYS BIT(3)
+#define AXP2101_STATUS1_VBUS_GOOD BIT(5)
+#define AXP2101_STATUS1_BAT_PRESENT BIT(3)
+#define AXP2101_STATUS2_VBUS_ABSENT BIT(3)
+#define AXP2101_CHARGE_STATE_MASK 0x07
+#define AXP2101_POWER_STATE_SHIFT 5
+#define AXP2101_POWER_STATE_CHARGING 0x01
+#define AXP2101_POWER_STATE_DISCHARGING 0x02
 #define AXP2101_PKEY_SHORT_IRQ BIT(3)
 #define AXP2101_PKEY_IRQ_MASK AXP2101_PKEY_SHORT_IRQ
 
@@ -153,6 +174,20 @@ typedef struct {
     float temperature_c;
 } imu_sample_t;
 
+typedef struct {
+    bool valid;
+    bool battery_present;
+    bool vbus_present;
+    bool vbus_good;
+    bool charging;
+    bool discharging;
+    uint8_t charge_state;
+    int percent;
+    uint16_t battery_mv;
+    uint16_t vbus_mv;
+    uint16_t system_mv;
+} power_status_t;
+
 static uint8_t s_qmi8658_addr = QMI8658_ADDR_LOW;
 static uint8_t s_tca9554_output = 0x00;
 static bool s_visualizer_enabled = true;
@@ -167,6 +202,7 @@ static int s_wifi_retry_count = 0;
 static bool s_wifi_ready = false;
 
 static esp_err_t set_visualizer_enabled(esp_lcd_panel_handle_t panel, bool enabled);
+static void render_power_status(esp_lcd_panel_handle_t panel);
 
 static esp_err_t tca9554_write(uint8_t reg, uint8_t value)
 {
@@ -201,6 +237,24 @@ static esp_err_t i2c_reg_write(uint8_t dev_addr, uint8_t reg, uint8_t value)
 static esp_err_t i2c_reg_read(uint8_t dev_addr, uint8_t reg, uint8_t *data, size_t len)
 {
     return i2c_master_write_read_device(I2C_PORT, dev_addr, &reg, 1, data, len, pdMS_TO_TICKS(100));
+}
+
+static esp_err_t i2c_reg_read_h5l8(uint8_t dev_addr, uint8_t high_reg, uint8_t low_reg, uint16_t *value)
+{
+    uint8_t raw[2] = {0};
+    (void)low_reg;
+    ESP_RETURN_ON_ERROR(i2c_reg_read(dev_addr, high_reg, raw, 2), TAG, "read h5l8 register 0x%02x", high_reg);
+    *value = ((uint16_t)(raw[0] & 0x1F) << 8) | raw[1];
+    return ESP_OK;
+}
+
+static esp_err_t i2c_reg_read_h6l8(uint8_t dev_addr, uint8_t high_reg, uint8_t low_reg, uint16_t *value)
+{
+    uint8_t raw[2] = {0};
+    (void)low_reg;
+    ESP_RETURN_ON_ERROR(i2c_reg_read(dev_addr, high_reg, raw, 2), TAG, "read h6l8 register 0x%02x", high_reg);
+    *value = ((uint16_t)(raw[0] & 0x3F) << 8) | raw[1];
+    return ESP_OK;
 }
 
 static esp_err_t i2c_reg_update(uint8_t dev_addr, uint8_t reg, uint8_t mask, uint8_t value)
@@ -285,8 +339,12 @@ static bool boot_button_is_held(void)
 static esp_err_t axp2101_init_power_button_irq(void)
 {
     uint8_t enabled = 0;
+    uint8_t adc_ctrl = 0;
 
-    ESP_LOGI(TAG, "Initialize AXP2101 PWR short-press IRQ polling");
+    ESP_LOGI(TAG, "Initialize AXP2101 PMU status and PWR short-press IRQ polling");
+    ESP_RETURN_ON_ERROR(i2c_reg_read(AXP2101_ADDR, AXP2101_REG_ADC_CHANNEL_CTRL, &adc_ctrl, 1), TAG, "read AXP2101 ADC channel control");
+    adc_ctrl |= AXP2101_ADC_ENABLE_BATT | AXP2101_ADC_ENABLE_VBUS | AXP2101_ADC_ENABLE_VSYS;
+    ESP_RETURN_ON_ERROR(i2c_reg_write(AXP2101_ADDR, AXP2101_REG_ADC_CHANNEL_CTRL, adc_ctrl), TAG, "enable AXP2101 voltage ADCs");
     ESP_RETURN_ON_ERROR(i2c_reg_write(AXP2101_ADDR, AXP2101_REG_INTSTS1, 0xFF), TAG, "clear AXP2101 INTSTS1");
     ESP_RETURN_ON_ERROR(i2c_reg_write(AXP2101_ADDR, AXP2101_REG_INTSTS1 + 1, 0xFF), TAG, "clear AXP2101 INTSTS2");
     ESP_RETURN_ON_ERROR(i2c_reg_write(AXP2101_ADDR, AXP2101_REG_INTSTS1 + 2, 0xFF), TAG, "clear AXP2101 INTSTS3");
@@ -311,6 +369,37 @@ static bool axp2101_power_button_short_pressed(void)
     ESP_LOGI(TAG, "AXP2101 PWR IRQ status=0x%02x", status);
     ESP_ERROR_CHECK(i2c_reg_write(AXP2101_ADDR, AXP2101_REG_INTSTS2, pkey_status));
     return (pkey_status & AXP2101_PKEY_SHORT_IRQ) != 0;
+}
+
+static esp_err_t axp2101_read_power_status(power_status_t *status)
+{
+    uint8_t status1 = 0;
+    uint8_t status2 = 0;
+    uint8_t percent = 0;
+
+    memset(status, 0, sizeof(*status));
+    ESP_RETURN_ON_ERROR(i2c_reg_read(AXP2101_ADDR, AXP2101_REG_STATUS1, &status1, 1), TAG, "read AXP2101 STATUS1");
+    ESP_RETURN_ON_ERROR(i2c_reg_read(AXP2101_ADDR, AXP2101_REG_STATUS2, &status2, 1), TAG, "read AXP2101 STATUS2");
+
+    status->valid = true;
+    status->battery_present = (status1 & AXP2101_STATUS1_BAT_PRESENT) != 0;
+    status->vbus_good = (status1 & AXP2101_STATUS1_VBUS_GOOD) != 0;
+    status->vbus_present = status->vbus_good && ((status2 & AXP2101_STATUS2_VBUS_ABSENT) == 0);
+    status->charging = (status2 >> AXP2101_POWER_STATE_SHIFT) == AXP2101_POWER_STATE_CHARGING;
+    status->discharging = (status2 >> AXP2101_POWER_STATE_SHIFT) == AXP2101_POWER_STATE_DISCHARGING;
+    status->charge_state = status2 & AXP2101_CHARGE_STATE_MASK;
+    status->percent = -1;
+
+    if (status->battery_present) {
+        ESP_RETURN_ON_ERROR(i2c_reg_read(AXP2101_ADDR, AXP2101_REG_BAT_PERCENT, &percent, 1), TAG, "read AXP2101 battery percent");
+        status->percent = percent;
+        ESP_RETURN_ON_ERROR(i2c_reg_read_h5l8(AXP2101_ADDR, AXP2101_REG_ADC_BAT_H, AXP2101_REG_ADC_BAT_L, &status->battery_mv), TAG, "read AXP2101 battery voltage");
+    }
+    if (status->vbus_present) {
+        ESP_RETURN_ON_ERROR(i2c_reg_read_h6l8(AXP2101_ADDR, AXP2101_REG_ADC_VBUS_H, AXP2101_REG_ADC_VBUS_L, &status->vbus_mv), TAG, "read AXP2101 VBUS voltage");
+    }
+    ESP_RETURN_ON_ERROR(i2c_reg_read_h6l8(AXP2101_ADDR, AXP2101_REG_ADC_VSYS_H, AXP2101_REG_ADC_VSYS_L, &status->system_mv), TAG, "read AXP2101 system voltage");
+    return ESP_OK;
 }
 
 static esp_err_t storage_init(void)
@@ -491,6 +580,7 @@ static const uint8_t *font5x7(char c)
     static const uint8_t glyph_question[5] = {0x02, 0x01, 0x51, 0x09, 0x06};
     static const uint8_t glyph_colon[5] = {0x00, 0x36, 0x36, 0x00, 0x00};
     static const uint8_t glyph_dash[5] = {0x08, 0x08, 0x08, 0x08, 0x08};
+    static const uint8_t glyph_plus[5] = {0x08, 0x08, 0x3e, 0x08, 0x08};
     static const uint8_t glyph_quote[5] = {0x00, 0x07, 0x00, 0x07, 0x00};
     static const uint8_t glyph_apostrophe[5] = {0x00, 0x00, 0x07, 0x00, 0x00};
 
@@ -540,6 +630,7 @@ static const uint8_t *font5x7(char c)
     case '?': return glyph_question;
     case ':': return glyph_colon;
     case '-': return glyph_dash;
+    case '+': return glyph_plus;
     case '"': return glyph_quote;
     case '\'': return glyph_apostrophe;
     default: return blank;
@@ -779,6 +870,66 @@ static void render_command_screen(esp_lcd_panel_handle_t panel)
 {
     draw_audio_background(panel);
     render_wrapped_text(panel, s_last_command_text);
+    render_power_status(panel);
+}
+
+static void render_power_status(esp_lcd_panel_handle_t panel)
+{
+    power_status_t status = {0};
+    uint16_t *buffer = heap_caps_malloc(118 * 20 * sizeof(uint16_t), MALLOC_CAP_DMA);
+    const uint16_t bg = rgb565(5, 9, 12);
+    const uint16_t border = rgb565(86, 112, 112);
+    const uint16_t fill_ok = rgb565(60, 185, 130);
+    const uint16_t fill_low = rgb565(220, 70, 70);
+    const uint16_t fill_charge = rgb565(255, 196, 60);
+    const uint16_t text = rgb565(190, 215, 210);
+    const int x = LCD_H_RES - 126;
+    const int y = 24;
+    char label[8] = "--";
+
+    ESP_ERROR_CHECK(buffer ? ESP_OK : ESP_ERR_NO_MEM);
+    fill_rect(panel, buffer, x, y, x + 118, y + 20, bg);
+    heap_caps_free(buffer);
+
+    if (axp2101_read_power_status(&status) != ESP_OK || !status.valid) {
+        draw_char(panel, x + 56, y + 1, '?', text, bg);
+        return;
+    }
+
+    if (status.battery_present && status.percent >= 0) {
+        int display_percent = clamp_int(status.percent, 0, 100);
+        snprintf(label, sizeof(label), "%d%%", display_percent);
+    } else if (status.vbus_present) {
+        snprintf(label, sizeof(label), "USB");
+    } else {
+        snprintf(label, sizeof(label), "BAT");
+    }
+
+    uint16_t *icon = heap_caps_malloc(34 * 14 * sizeof(uint16_t), MALLOC_CAP_DMA);
+    ESP_ERROR_CHECK(icon ? ESP_OK : ESP_ERR_NO_MEM);
+    fill_rect(panel, icon, x, y + 3, x + 30, y + 17, bg);
+    fill_rect(panel, icon, x, y + 3, x + 28, y + 5, border);
+    fill_rect(panel, icon, x, y + 15, x + 28, y + 17, border);
+    fill_rect(panel, icon, x, y + 3, x + 2, y + 17, border);
+    fill_rect(panel, icon, x + 26, y + 3, x + 28, y + 17, border);
+    fill_rect(panel, icon, x + 28, y + 7, x + 32, y + 13, border);
+
+    if (status.battery_present && status.percent >= 0) {
+        int fill_w = clamp_int((status.percent * 22) / 100, 1, 22);
+        fill_rect(panel, icon, x + 4, y + 7, x + 4 + fill_w, y + 13,
+                  status.charging ? fill_charge : (status.percent <= 20 ? fill_low : fill_ok));
+    } else if (status.vbus_present) {
+        fill_rect(panel, icon, x + 8, y + 7, x + 20, y + 13, fill_charge);
+    }
+    heap_caps_free(icon);
+
+    for (size_t i = 0; label[i] != '\0' && i < 5; ++i) {
+        draw_char(panel, x + 40 + (int)i * UI_CHAR_W, y + 1, label[i], text, bg);
+    }
+
+    if (status.charging || status.vbus_present) {
+        draw_char(panel, x + 92, y + 1, '+', fill_charge, bg);
+    }
 }
 
 static void render_status_band(esp_lcd_panel_handle_t panel, uint16_t color)
@@ -1330,7 +1481,15 @@ void app_main(void)
         }
 
         if ((tick++ % 40) == 0) {
+            power_status_t power = {0};
             ESP_LOGI(TAG, "alive uptime_ms=%" PRIu32, esp_log_timestamp());
+            render_power_status(display.panel);
+            if (axp2101_read_power_status(&power) == ESP_OK) {
+                ESP_LOGI(TAG, "power batt_present=%d percent=%d batt_mv=%u vbus_present=%d vbus_good=%d vbus_mv=%u charging=%d discharging=%d charge_state=%u system_mv=%u",
+                         power.battery_present, power.percent, power.battery_mv,
+                         power.vbus_present, power.vbus_good, power.vbus_mv,
+                         power.charging, power.discharging, power.charge_state, power.system_mv);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
