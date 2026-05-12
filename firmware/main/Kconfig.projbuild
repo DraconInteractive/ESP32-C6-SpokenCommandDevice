@@ -1,0 +1,31 @@
+menu "Spoken command device"
+
+config SPOKEN_COMMAND_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+    help
+        Home Wi-Fi network SSID used by the ESP32-C6 command device.
+
+config SPOKEN_COMMAND_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+    help
+        Home Wi-Fi password. Leave empty for an open network or when Wi-Fi is
+        intentionally disabled during local hardware testing.
+
+config SPOKEN_COMMAND_SERVER_URL
+    string "Command server audio endpoint"
+    default "http://192.168.1.100:8080/audio/command"
+    help
+        Full URL for the local command bridge server.
+
+config SPOKEN_COMMAND_CAPTURE_MS
+    int "Command capture safety cap in milliseconds"
+    range 500 60000
+    default 10000
+    help
+        Maximum length of microphone audio streamed while the interaction
+        button is held. Audio is sent as signed 16-bit little-endian mono PCM
+        at 16 kHz.
+
+endmenu

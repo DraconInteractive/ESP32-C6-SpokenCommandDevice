@@ -1,0 +1,21 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+server/.env.local
+
+# ESP-IDF generated files and local configuration
+firmware/build/
+firmware/managed_components/
+firmware/dependencies.lock
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Editor/OS noise
+.DS_Store
+*.swp
+*~
