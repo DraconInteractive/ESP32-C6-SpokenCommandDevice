@@ -27,6 +27,7 @@ MODEL_ID = os.environ.get("ELEVENLABS_MODEL_ID", "scribe_v2")
 MAX_AUDIO_BYTES = int(os.environ.get("COMMAND_SERVER_MAX_AUDIO_BYTES", str(4 * 1024 * 1024)))
 
 RECENT_COMMANDS: list[dict[str, Any]] = []
+MUTED_DEVICES: dict[str, bool] = {}
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -140,58 +141,83 @@ def normalize_command_text(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 
-def command_response(transcript_text: str) -> dict[str, Any]:
+def apply_mute_state(device_id: str, response: dict[str, Any]) -> dict[str, Any]:
+    if MUTED_DEVICES.get(device_id, False):
+        response["tone"] = "none"
+    return response
+
+
+def command_response(transcript_text: str, device_id: str = "unknown") -> dict[str, Any]:
     text = transcript_text.strip()
     normalized = normalize_command_text(text)
 
     if not text:
-        return {
+        return apply_mute_state(device_id, {
             "ok": False,
             "transcript": "",
             "display_text": "No speech heard.",
             "tone": "error",
+        })
+
+    if normalized == "mute":
+        MUTED_DEVICES[device_id] = True
+        return {
+            "ok": True,
+            "transcript": text,
+            "display_text": "Muted.",
+            "tone": "none",
+        }
+
+    if normalized == "unmute":
+        MUTED_DEVICES[device_id] = False
+        return {
+            "ok": True,
+            "transcript": text,
+            "display_text": "Unmuted.",
+            "tone": "success",
         }
 
     if normalized in {"test", "ping"}:
-        return {
+        return apply_mute_state(device_id, {
             "ok": True,
             "transcript": text,
             "display_text": "Ready.",
             "tone": "success",
-        }
+        })
 
     if normalized in {"help", "commands", "what can you do"}:
-        return {
+        return apply_mute_state(device_id, {
             "ok": True,
             "transcript": text,
-            "display_text": "Commands: test, status, repeat.",
+            "display_text": "Commands: test, status, mute, repeat.",
             "tone": "success",
-        }
+        })
 
     if normalized in {"status", "server status"}:
-        return {
+        muted = MUTED_DEVICES.get(device_id, False)
+        return apply_mute_state(device_id, {
             "ok": True,
             "transcript": text,
-            "display_text": "Server online.",
+            "display_text": f"Server online. {'Muted.' if muted else 'Sound on.'}",
             "tone": "success",
-        }
+        })
 
     for prefix in ("repeat ", "say "):
         if normalized.startswith(prefix):
             display_text = text[len(prefix):].strip()
-            return {
+            return apply_mute_state(device_id, {
                 "ok": bool(display_text),
                 "transcript": text,
                 "display_text": display_text or "Nothing to repeat.",
                 "tone": "success" if display_text else "error",
-            }
+            })
 
-    return {
+    return apply_mute_state(device_id, {
         "ok": True,
         "transcript": text,
         "display_text": f"Heard: {text}",
         "tone": "success",
-    }
+    })
 
 
 class CommandHandler(BaseHTTPRequestHandler):
@@ -227,7 +253,7 @@ class CommandHandler(BaseHTTPRequestHandler):
 
             started = time.monotonic()
             transcript = transcribe_with_elevenlabs(wav_bytes)
-            device_response = command_response(transcript.get("text", ""))
+            device_response = command_response(transcript.get("text", ""), device_id)
             record = {
                 "device_id": device_id,
                 "received_at": int(time.time()),
@@ -235,6 +261,7 @@ class CommandHandler(BaseHTTPRequestHandler):
                 "text": device_response["transcript"],
                 "display_text": device_response["display_text"],
                 "tone": device_response["tone"],
+                "muted": MUTED_DEVICES.get(device_id, False),
                 "transcript": transcript,
             }
             RECENT_COMMANDS.append(record)

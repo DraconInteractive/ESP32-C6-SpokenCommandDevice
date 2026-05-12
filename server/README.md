@@ -47,5 +47,7 @@ The current ElevenLabs STT call uses `POST https://api.elevenlabs.io/v1/speech-t
 - `test` or `ping` returns `Ready.`
 - `status` returns `Server online.`
 - `help` returns a short command list.
+- `mute` disables response tones for that device.
+- `unmute` enables response tones for that device.
 - `repeat ...` or `say ...` displays the spoken suffix.
 - Anything else displays `Heard: ...`.
