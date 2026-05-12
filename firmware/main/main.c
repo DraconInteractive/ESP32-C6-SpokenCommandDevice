@@ -23,6 +23,7 @@
 #include "esp_lcd_touch_ft5x06.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "es8311.h"
@@ -82,6 +83,7 @@ static const char *TAG = "waveshare_c6";
 #define AXP2101_ADDR 0x34
 #define AXP2101_REG_STATUS1 0x00
 #define AXP2101_REG_STATUS2 0x01
+#define AXP2101_REG_COMMON_CONFIG 0x10
 #define AXP2101_REG_ADC_CHANNEL_CTRL 0x30
 #define AXP2101_REG_ADC_BAT_H 0x34
 #define AXP2101_REG_ADC_BAT_L 0x35
@@ -103,6 +105,7 @@ static const char *TAG = "waveshare_c6";
 #define AXP2101_POWER_STATE_SHIFT 5
 #define AXP2101_POWER_STATE_CHARGING 0x01
 #define AXP2101_POWER_STATE_DISCHARGING 0x02
+#define AXP2101_SHUTDOWN_BIT BIT(0)
 #define AXP2101_PKEY_SHORT_IRQ BIT(3)
 #define AXP2101_PKEY_IRQ_MASK AXP2101_PKEY_SHORT_IRQ
 
@@ -203,6 +206,7 @@ static bool s_wifi_ready = false;
 
 static esp_err_t set_visualizer_enabled(esp_lcd_panel_handle_t panel, bool enabled);
 static void render_power_status(esp_lcd_panel_handle_t panel);
+static void enter_power_off(esp_lcd_panel_handle_t panel);
 
 static esp_err_t tca9554_write(uint8_t reg, uint8_t value)
 {
@@ -353,6 +357,14 @@ static esp_err_t axp2101_init_power_button_irq(void)
     return i2c_reg_write(AXP2101_ADDR, AXP2101_REG_INTEN2, enabled);
 }
 
+static esp_err_t axp2101_clear_power_irqs(void)
+{
+    ESP_RETURN_ON_ERROR(i2c_reg_write(AXP2101_ADDR, AXP2101_REG_INTSTS1, 0xFF), TAG, "clear AXP2101 INTSTS1");
+    ESP_RETURN_ON_ERROR(i2c_reg_write(AXP2101_ADDR, AXP2101_REG_INTSTS1 + 1, 0xFF), TAG, "clear AXP2101 INTSTS2");
+    ESP_RETURN_ON_ERROR(i2c_reg_write(AXP2101_ADDR, AXP2101_REG_INTSTS1 + 2, 0xFF), TAG, "clear AXP2101 INTSTS3");
+    return ESP_OK;
+}
+
 static bool axp2101_power_button_short_pressed(void)
 {
     uint8_t status = 0;
@@ -400,6 +412,11 @@ static esp_err_t axp2101_read_power_status(power_status_t *status)
     }
     ESP_RETURN_ON_ERROR(i2c_reg_read_h6l8(AXP2101_ADDR, AXP2101_REG_ADC_VSYS_H, AXP2101_REG_ADC_VSYS_L, &status->system_mv), TAG, "read AXP2101 system voltage");
     return ESP_OK;
+}
+
+static esp_err_t axp2101_shutdown(void)
+{
+    return i2c_reg_update(AXP2101_ADDR, AXP2101_REG_COMMON_CONFIG, AXP2101_SHUTDOWN_BIT, AXP2101_SHUTDOWN_BIT);
 }
 
 static esp_err_t storage_init(void)
@@ -1244,6 +1261,39 @@ static void run_command_interaction(esp_lcd_panel_handle_t panel)
     render_command_screen(panel);
 }
 
+static void enter_power_off(esp_lcd_panel_handle_t panel)
+{
+    ESP_LOGI(TAG, "Power button pressed; entering PMU shutdown");
+    strlcpy(s_last_command_text, "Powering off.", sizeof(s_last_command_text));
+    draw_audio_background(panel);
+    render_wrapped_text(panel, s_last_command_text);
+    render_status_band(panel, rgb565(255, 196, 60));
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    if (s_i2s_rx != NULL) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_disable(s_i2s_rx));
+    }
+    if (s_i2s_tx != NULL) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_disable(s_i2s_tx));
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(set_mic_power(false));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(panel, false));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_stop());
+
+    uint8_t adc_ctrl = 0;
+    if (i2c_reg_read(AXP2101_ADDR, AXP2101_REG_ADC_CHANNEL_CTRL, &adc_ctrl, 1) == ESP_OK) {
+        adc_ctrl &= ~(AXP2101_ADC_ENABLE_BATT | AXP2101_ADC_ENABLE_VBUS | AXP2101_ADC_ENABLE_VSYS);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_reg_write(AXP2101_ADDR, AXP2101_REG_ADC_CHANNEL_CTRL, adc_ctrl));
+    }
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(axp2101_shutdown());
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGW(TAG, "AXP2101 shutdown did not complete; falling back to ESP deep sleep. Use reset or a power cycle to wake.");
+    fflush(stdout);
+    esp_deep_sleep_start();
+}
+
 static esp_err_t set_visualizer_enabled(esp_lcd_panel_handle_t panel, bool enabled)
 {
     if (s_visualizer_enabled == enabled) {
@@ -1448,7 +1498,8 @@ void app_main(void)
     if (wifi_ret != ESP_OK) {
         ESP_LOGW(TAG, "Wi-Fi startup incomplete: %s", esp_err_to_name(wifi_ret));
     }
-    ESP_LOGI(TAG, "Microphone level visualization ready; press PWR for standby or hold BOOT for command capture");
+    ESP_LOGI(TAG, "Microphone level visualization ready; press PWR for PMU shutdown or hold BOOT for command capture");
+    ESP_ERROR_CHECK(axp2101_clear_power_irqs());
 
     uint32_t tick = 0;
 
@@ -1458,7 +1509,7 @@ void app_main(void)
         }
 
         if (axp2101_power_button_short_pressed()) {
-            ESP_ERROR_CHECK(set_visualizer_enabled(display.panel, !s_visualizer_enabled));
+            enter_power_off(display.panel);
         }
 
         if (!s_visualizer_enabled) {
