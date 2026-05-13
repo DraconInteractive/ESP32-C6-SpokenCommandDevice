@@ -22,6 +22,7 @@
 #include "esp_lcd_touch.h"
 #include "esp_lcd_touch_ft5x06.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
@@ -202,6 +203,7 @@ static int16_t s_audio_samples[AUDIO_RECV_SAMPLES * 2] = {0};
 static int16_t s_command_chunk[AUDIO_RECV_SAMPLES] = {0};
 static int16_t s_tone_chunk[TONE_CHUNK_FRAMES * 2] = {0};
 static char s_last_command_text[COMMAND_TEXT_MAX] = "Hold BOOT and speak.";
+static char s_device_id[40] = "waveshare-c6-unknown";
 static EventGroupHandle_t s_wifi_event_group = NULL;
 static int s_wifi_retry_count = 0;
 static bool s_wifi_ready = false;
@@ -494,6 +496,15 @@ static esp_err_t wifi_init_sta(void)
 
     ESP_LOGI(TAG, "Command server URL: %s", CONFIG_SPOKEN_COMMAND_SERVER_URL);
     return ESP_OK;
+}
+
+static void init_device_id(void)
+{
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        snprintf(s_device_id, sizeof(s_device_id), "waveshare-c6-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    }
+    ESP_LOGI(TAG, "Device ID: %s", s_device_id);
 }
 
 static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
@@ -1239,7 +1250,7 @@ static esp_err_t stream_command_audio(esp_lcd_panel_handle_t panel)
     ESP_GOTO_ON_ERROR(esp_http_client_set_header(client, "Content-Type", "application/octet-stream"), cleanup, TAG, "set content type");
     ESP_GOTO_ON_ERROR(esp_http_client_set_header(client, "X-Audio-Sample-Rate", "16000"), cleanup, TAG, "set sample rate");
     ESP_GOTO_ON_ERROR(esp_http_client_set_header(client, "X-Audio-Channels", "1"), cleanup, TAG, "set channels");
-    ESP_GOTO_ON_ERROR(esp_http_client_set_header(client, "X-Device-Id", "waveshare-c6-touch-amoled"), cleanup, TAG, "set device id");
+    ESP_GOTO_ON_ERROR(esp_http_client_set_header(client, "X-Device-Id", s_device_id), cleanup, TAG, "set device id");
     ESP_GOTO_ON_ERROR(esp_http_client_open(client, -1), cleanup, TAG, "open chunked HTTP stream");
 
     render_recording_band(panel, captured);
@@ -1568,6 +1579,7 @@ void app_main(void)
     log_chip_details();
 
     ESP_ERROR_CHECK(storage_init());
+    init_device_id();
     ESP_ERROR_CHECK(buttons_init());
     app_display_t display = display_init();
     ESP_ERROR_CHECK(axp2101_init_power_button_irq());

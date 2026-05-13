@@ -16,7 +16,10 @@ The server listens on `0.0.0.0:8080` by default.
 ## Endpoints
 
 - `GET /health` returns a basic health check.
-- `GET /commands/recent` returns recent transcripts kept in memory.
+- `GET /devices` returns known devices and their server-side state.
+- `GET /devices/{device_id}` returns one known device.
+- `GET /commands/recent` returns recent transcripts kept in memory. Add
+  `?device_id=waveshare-c6-fdda98` to filter by device.
 - `POST /audio/command` accepts either WAV or raw PCM audio. Raw PCM may use a
   normal `Content-Length` request or HTTP chunked transfer. It returns a compact
   device response:
@@ -40,8 +43,11 @@ For raw PCM, send:
 Content-Type: application/octet-stream
 X-Audio-Sample-Rate: 16000
 X-Audio-Channels: 1
-X-Device-Id: waveshare-c6
+X-Device-Id: waveshare-c6-fdda98
 ```
+
+Firmware derives `X-Device-Id` from the board Wi-Fi MAC suffix, so each physical
+board has separate mute state, pending prompts, and command history.
 
 The current ElevenLabs STT call uses `POST https://api.elevenlabs.io/v1/speech-to-text`,
 `model_id=scribe_v2`, and a multipart `file` field.

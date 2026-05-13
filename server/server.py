@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import threading
 import time
 import uuid
 import wave
@@ -20,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, urlparse
 
 
 HOST = os.environ.get("COMMAND_SERVER_HOST", "0.0.0.0")
@@ -31,6 +33,8 @@ MAX_AUDIO_BYTES = int(os.environ.get("COMMAND_SERVER_MAX_AUDIO_BYTES", str(4 * 1
 RECENT_COMMANDS: list[dict[str, Any]] = []
 MUTED_DEVICES: dict[str, bool] = {}
 PENDING_ACTIONS: dict[str, dict[str, Any]] = {}
+DEVICES: dict[str, dict[str, Any]] = {}
+STATE_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -150,6 +154,54 @@ def transcribe_with_elevenlabs(wav_bytes: bytes) -> dict[str, Any]:
 
 def normalize_command_text(text: str) -> str:
     return " ".join(text.strip().lower().split())
+
+
+def clean_device_id(device_id: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", device_id.strip())
+    return cleaned[:64] or "unknown"
+
+
+def public_device(device_id: str) -> dict[str, Any]:
+    device = DEVICES.get(device_id, {})
+    pending = PENDING_ACTIONS.get(device_id)
+    return {
+        "id": device_id,
+        "first_seen": device.get("first_seen"),
+        "last_seen": device.get("last_seen"),
+        "remote_addr": device.get("remote_addr"),
+        "user_agent": device.get("user_agent", ""),
+        "request_count": device.get("request_count", 0),
+        "muted": MUTED_DEVICES.get(device_id, False),
+        "pending": pending,
+        "last_command": device.get("last_command"),
+        "last_transcript": device.get("last_transcript", ""),
+        "last_display_text": device.get("last_display_text", ""),
+    }
+
+
+def touch_device(device_id: str, handler: BaseHTTPRequestHandler | None = None) -> None:
+    now = int(time.time())
+    device = DEVICES.setdefault(device_id, {
+        "id": device_id,
+        "first_seen": now,
+        "request_count": 0,
+    })
+    device["last_seen"] = now
+    device["request_count"] = int(device.get("request_count", 0)) + 1
+    if handler is not None:
+        device["remote_addr"] = handler.client_address[0]
+        device["user_agent"] = handler.headers.get("User-Agent", "")
+
+
+def update_device_result(device_id: str, response: dict[str, Any]) -> None:
+    device = DEVICES.setdefault(device_id, {
+        "id": device_id,
+        "first_seen": int(time.time()),
+        "request_count": 0,
+    })
+    device["last_command"] = response.get("command")
+    device["last_transcript"] = response.get("transcript", "")
+    device["last_display_text"] = response.get("display_text", "")
 
 
 def base_response(ok: bool, transcript: str, display_text: str, tone: str = "success", command: str | None = None,
@@ -385,37 +437,67 @@ def dispatch_command(text: str, device_id: str) -> dict[str, Any] | None:
 
 
 def command_response(transcript_text: str, device_id: str = "unknown") -> dict[str, Any]:
-    text = transcript_text.strip()
-    normalized = normalize_command_text(text)
+    with STATE_LOCK:
+        text = transcript_text.strip()
+        normalized = normalize_command_text(text)
 
-    if not text:
-        return apply_mute_state(device_id, base_response(False, "", "No speech heard.", "error"))
+        if not text:
+            return apply_mute_state(device_id, base_response(False, "", "No speech heard.", "error"))
 
-    if normalized in {"mute", "unmute", "status", "server status", "help", "commands", "what can you do", "cancel", "stop", "nevermind", "never mind"}:
+        if normalized in {"mute", "unmute", "status", "server status", "help", "commands", "what can you do", "cancel", "stop", "nevermind", "never mind"}:
+            command = dispatch_command(text, device_id)
+            if command is not None:
+                return command
+
+        pending_response = handle_pending_action(device_id, text, normalized)
+        if pending_response is not None:
+            return pending_response
+
         command = dispatch_command(text, device_id)
         if command is not None:
             return command
 
-    pending_response = handle_pending_action(device_id, text, normalized)
-    if pending_response is not None:
-        return pending_response
-
-    command = dispatch_command(text, device_id)
-    if command is not None:
-        return command
-
-    return apply_mute_state(device_id, base_response(True, text, f"Heard: {text}", "success", command="unknown"))
+        return apply_mute_state(device_id, base_response(True, text, f"Heard: {text}", "success", command="unknown"))
 
 
 class CommandHandler(BaseHTTPRequestHandler):
     server_version = "SpokenCommandServer/0.1"
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+
+        if parsed.path == "/health":
             json_response(self, 200, {"ok": True, "service": "spoken-command-server"})
             return
-        if self.path == "/commands/recent":
-            json_response(self, 200, {"commands": RECENT_COMMANDS[-20:]})
+        if parsed.path == "/devices":
+            with STATE_LOCK:
+                devices = [public_device(device_id) for device_id in sorted(DEVICES)]
+            json_response(self, 200, {"devices": devices})
+            return
+        if parsed.path.startswith("/devices/"):
+            device_id = clean_device_id(parsed.path.removeprefix("/devices/"))
+            with STATE_LOCK:
+                if device_id not in DEVICES:
+                    json_response(self, 404, {"error": "device not found"})
+                    return
+                device = public_device(device_id)
+            json_response(self, 200, {"device": device})
+            return
+        if parsed.path == "/commands/recent":
+            device_filter = query.get("device_id", [None])[0]
+            limit_text = query.get("limit", ["20"])[0]
+            try:
+                limit = max(1, min(int(limit_text), 100))
+            except ValueError:
+                limit = 20
+            with STATE_LOCK:
+                commands = RECENT_COMMANDS
+                if device_filter:
+                    device_filter = clean_device_id(device_filter)
+                    commands = [command for command in commands if command.get("device_id") == device_filter]
+                commands = commands[-limit:]
+            json_response(self, 200, {"commands": commands})
             return
         json_response(self, 404, {"error": "not found"})
 
@@ -429,7 +511,9 @@ class CommandHandler(BaseHTTPRequestHandler):
             content_type = self.headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
             sample_rate = int(self.headers.get("X-Audio-Sample-Rate", "16000"))
             channels = int(self.headers.get("X-Audio-Channels", "1"))
-            device_id = self.headers.get("X-Device-Id", "unknown")
+            device_id = clean_device_id(self.headers.get("X-Device-Id", "unknown"))
+            with STATE_LOCK:
+                touch_device(device_id, self)
 
             if content_type in ("audio/wav", "audio/x-wav"):
                 wav_bytes = body
@@ -453,8 +537,10 @@ class CommandHandler(BaseHTTPRequestHandler):
                 "muted": MUTED_DEVICES.get(device_id, False),
                 "transcript": transcript,
             }
-            RECENT_COMMANDS.append(record)
-            del RECENT_COMMANDS[:-50]
+            with STATE_LOCK:
+                update_device_result(device_id, device_response)
+                RECENT_COMMANDS.append(record)
+                del RECENT_COMMANDS[:-100]
             json_response(self, 200, device_response)
         except Exception as exc:
             json_response(self, 400, {
