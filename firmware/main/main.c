@@ -15,6 +15,7 @@
 #include "esp_flash.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_lcd_sh8601.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
@@ -58,6 +59,8 @@ static const char *TAG = "waveshare_c6";
 #define UI_FONT_H 7
 #define UI_CHAR_W ((UI_FONT_W + 1) * UI_FONT_SCALE)
 #define UI_LINE_H ((UI_FONT_H + 2) * UI_FONT_SCALE)
+#define DEVICE_EVENT_POLL_INTERVAL_US (5LL * 1000LL * 1000LL)
+#define ALERT_DISPLAY_TIME_US (5LL * 1000LL * 1000LL)
 
 #define LCD_PIN_CS GPIO_NUM_5
 #define LCD_PIN_PCLK GPIO_NUM_0
@@ -117,6 +120,7 @@ static const char *TAG = "waveshare_c6";
 #define COMMAND_HTTP_RESPONSE_MAX 512
 #define COMMAND_TEXT_MAX 192
 #define HTTP_CHUNK_HEADER_MAX 16
+#define DEVICE_EVENTS_URL_MAX 192
 #define TONE_CHUNK_FRAMES 128
 #define WIFI_CONNECT_TIMEOUT_MS 12000
 #define WIFI_CONNECTED_BIT BIT(0)
@@ -211,6 +215,7 @@ static bool s_wifi_ready = false;
 static esp_err_t set_visualizer_enabled(esp_lcd_panel_handle_t panel, bool enabled);
 static void render_power_status(esp_lcd_panel_handle_t panel);
 static void enter_power_off(esp_lcd_panel_handle_t panel);
+static esp_err_t poll_device_events(esp_lcd_panel_handle_t panel, esp_lcd_touch_handle_t touch);
 
 static esp_err_t tca9554_write(uint8_t reg, uint8_t value)
 {
@@ -692,6 +697,61 @@ static void draw_circle(esp_lcd_panel_handle_t panel, int center_x, int center_y
 
     ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, x0, y0, x1, y1, buffer));
     heap_caps_free(buffer);
+}
+
+static void draw_alert_circle(esp_lcd_panel_handle_t panel)
+{
+    const int radius = 92;
+    const int center_x = LCD_H_RES / 2;
+    const int center_y = LCD_V_RES / 2;
+    const uint16_t circle = rgb565(225, 52, 60);
+    const uint16_t mark = rgb565(255, 246, 232);
+    uint16_t *buffer = heap_caps_malloc((radius * 2) * sizeof(uint16_t), MALLOC_CAP_DMA);
+
+    ESP_ERROR_CHECK(buffer ? ESP_OK : ESP_ERR_NO_MEM);
+
+    for (int y = -radius; y < radius; ++y) {
+        int half_width = 0;
+        while ((half_width + 1) * (half_width + 1) + y * y <= radius * radius) {
+            half_width++;
+        }
+
+        fill_rect(panel, buffer,
+                  center_x - half_width,
+                  center_y + y,
+                  center_x + half_width,
+                  center_y + y + 1,
+                  circle);
+    }
+    heap_caps_free(buffer);
+
+    buffer = heap_caps_malloc(24 * 96 * sizeof(uint16_t), MALLOC_CAP_DMA);
+    ESP_ERROR_CHECK(buffer ? ESP_OK : ESP_ERR_NO_MEM);
+    fill_rect(panel, buffer, center_x - 8, center_y - 40, center_x + 8, center_y + 24, mark);
+    fill_rect(panel, buffer, center_x - 9, center_y + 48, center_x + 9, center_y + 66, mark);
+    heap_caps_free(buffer);
+}
+
+static bool touch_pressed(esp_lcd_touch_handle_t touch)
+{
+    uint16_t x[1] = {0};
+    uint16_t y[1] = {0};
+    uint16_t strength[1] = {0};
+    uint8_t count = 0;
+    esp_err_t ret;
+
+    if (touch == NULL) {
+        return false;
+    }
+    if (gpio_get_level(TOUCH_PIN_INT) != 0) {
+        return false;
+    }
+
+    ret = esp_lcd_touch_read_data(touch);
+    if (ret != ESP_OK) {
+        return false;
+    }
+    return esp_lcd_touch_get_coordinates(touch, x, y, strength, &count, 1) && count > 0;
 }
 
 static void draw_hline(esp_lcd_panel_handle_t panel, uint16_t *buffer, int x0, int x1, int y, uint16_t color)
@@ -1196,7 +1256,103 @@ static void play_device_tone(const char *tone)
         return;
     }
 
+    if (strcmp(tone, "alert") == 0) {
+        for (int i = 0; i < 3; ++i) {
+            (void)play_square_tone(1040, 85, 6200);
+            play_silence(55);
+        }
+        return;
+    }
+
     ESP_LOGW(TAG, "Unknown response tone: %s", tone);
+}
+
+static void build_device_events_url(char *url, size_t url_size)
+{
+    strlcpy(url, CONFIG_SPOKEN_COMMAND_SERVER_URL, url_size);
+    char *path = strstr(url, "/audio/command");
+    if (path != NULL) {
+        *path = '\0';
+    }
+    size_t used = strlen(url);
+    snprintf(url + used, url_size - used, "/devices/%s/events", s_device_id);
+}
+
+static void render_alert_event(esp_lcd_panel_handle_t panel, esp_lcd_touch_handle_t touch,
+                               const char *display_text, const char *tone)
+{
+    const int64_t alert_until_us = esp_timer_get_time() + ALERT_DISPLAY_TIME_US;
+    bool touch_was_pressed;
+
+    strlcpy(s_last_command_text, display_text && display_text[0] ? display_text : "Alert", sizeof(s_last_command_text));
+    render_command_screen(panel);
+    draw_alert_circle(panel);
+    play_device_tone(tone && tone[0] ? tone : "alert");
+
+    touch_was_pressed = touch_pressed(touch);
+    while (esp_timer_get_time() < alert_until_us) {
+        const bool touch_is_pressed = touch_pressed(touch);
+        if (touch_is_pressed && !touch_was_pressed) {
+            break;
+        }
+        touch_was_pressed = touch_is_pressed;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    render_command_screen(panel);
+}
+
+static esp_err_t poll_device_events(esp_lcd_panel_handle_t panel, esp_lcd_touch_handle_t touch)
+{
+    if (!s_wifi_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char url[DEVICE_EVENTS_URL_MAX] = {0};
+    command_http_response_t response = {0};
+    build_device_events_url(url, sizeof(url));
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = 2500,
+        .event_handler = command_http_event_handler,
+        .user_data = &response,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "create events HTTP client");
+
+    esp_err_t ret = esp_http_client_perform(client);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Device event poll failed: %s", esp_err_to_name(ret));
+        esp_http_client_cleanup(client);
+        return ret;
+    }
+
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "Device event poll status=%d", status);
+        return ESP_FAIL;
+    }
+
+    if (strstr(response.data, "\"type\"") == NULL) {
+        return ESP_OK;
+    }
+
+    char event_type[16] = {0};
+    char display_text[COMMAND_TEXT_MAX] = {0};
+    char tone[16] = {0};
+    if (!extract_json_string_field(response.data, "type", event_type, sizeof(event_type))) {
+        return ESP_OK;
+    }
+    extract_json_string_field(response.data, "display_text", display_text, sizeof(display_text));
+    extract_json_string_field(response.data, "tone", tone, sizeof(tone));
+
+    ESP_LOGI(TAG, "Device event type=%s display=%s tone=%s", event_type, display_text, tone);
+    if (strcmp(event_type, "alert") == 0) {
+        render_alert_event(panel, touch, display_text, tone);
+    }
+    return ESP_OK;
 }
 
 static esp_err_t write_all_http(esp_http_client_handle_t client, const char *data, int length)
@@ -1594,6 +1750,7 @@ void app_main(void)
     ESP_ERROR_CHECK(axp2101_clear_power_irqs());
 
     uint32_t tick = 0;
+    int64_t next_event_poll_us = 0;
 
     while (true) {
         if (boot_button_pressed()) {
@@ -1602,6 +1759,12 @@ void app_main(void)
 
         if (axp2101_power_button_short_pressed()) {
             enter_power_off(display.panel);
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        if (s_wifi_ready && now_us >= next_event_poll_us) {
+            next_event_poll_us = now_us + DEVICE_EVENT_POLL_INTERVAL_US;
+            (void)poll_device_events(display.panel, display.touch);
         }
 
         if (!s_visualizer_enabled) {

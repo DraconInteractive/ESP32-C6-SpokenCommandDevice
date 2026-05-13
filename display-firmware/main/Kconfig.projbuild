@@ -1,0 +1,22 @@
+menu "Spoken command display"
+
+config DISPLAY_NODE_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+    help
+        Home Wi-Fi network SSID used by the display-only ESP32-S3 node.
+
+config DISPLAY_NODE_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+    help
+        Home Wi-Fi password. Leave empty for an open network or when Wi-Fi is
+        intentionally disabled during local hardware testing.
+
+config DISPLAY_NODE_SERVER_URL
+    string "Command server base URL"
+    default "http://192.168.1.100:8080"
+    help
+        Base URL for the local command bridge server, without a trailing slash.
+
+endmenu

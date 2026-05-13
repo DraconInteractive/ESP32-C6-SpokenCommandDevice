@@ -1,0 +1,10 @@
+menu "TimerCamera command device"
+
+config TIMERCAM_COMMAND_SERVER_URL
+    string "Command server base URL"
+    default "http://192.168.4.20:8080"
+    help
+        Base URL for the local command server, for example
+        http://192.168.4.20:8080.
+
+endmenu

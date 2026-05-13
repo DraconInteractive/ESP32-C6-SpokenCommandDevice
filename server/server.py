@@ -34,6 +34,7 @@ RECENT_COMMANDS: list[dict[str, Any]] = []
 MUTED_DEVICES: dict[str, bool] = {}
 PENDING_ACTIONS: dict[str, dict[str, Any]] = {}
 DEVICES: dict[str, dict[str, Any]] = {}
+DEVICE_EVENTS: dict[str, list[dict[str, Any]]] = {}
 STATE_LOCK = threading.RLock()
 
 
@@ -166,6 +167,11 @@ def public_device(device_id: str) -> dict[str, Any]:
     pending = PENDING_ACTIONS.get(device_id)
     return {
         "id": device_id,
+        "type": device.get("type", "unknown"),
+        "model": device.get("model", ""),
+        "capabilities": device.get("capabilities", []),
+        "endpoints": device.get("endpoints", {}),
+        "status": device.get("status", {}),
         "first_seen": device.get("first_seen"),
         "last_seen": device.get("last_seen"),
         "remote_addr": device.get("remote_addr"),
@@ -173,6 +179,7 @@ def public_device(device_id: str) -> dict[str, Any]:
         "request_count": device.get("request_count", 0),
         "muted": MUTED_DEVICES.get(device_id, False),
         "pending": pending,
+        "pending_events": len(DEVICE_EVENTS.get(device_id, [])),
         "last_command": device.get("last_command"),
         "last_transcript": device.get("last_transcript", ""),
         "last_display_text": device.get("last_display_text", ""),
@@ -193,6 +200,31 @@ def touch_device(device_id: str, handler: BaseHTTPRequestHandler | None = None) 
         device["user_agent"] = handler.headers.get("User-Agent", "")
 
 
+def register_device(device_id: str, payload: dict[str, Any], handler: BaseHTTPRequestHandler | None = None) -> dict[str, Any]:
+    touch_device(device_id, handler)
+    device = DEVICES[device_id]
+
+    if "type" in payload:
+        device["type"] = str(payload.get("type", "unknown"))[:32]
+    if "model" in payload:
+        device["model"] = str(payload.get("model", ""))[:80]
+    if isinstance(payload.get("capabilities"), list):
+        device["capabilities"] = [str(item)[:40] for item in payload["capabilities"][:16]]
+    if isinstance(payload.get("endpoints"), dict):
+        device["endpoints"] = {
+            str(key)[:40]: str(value)[:240]
+            for key, value in payload["endpoints"].items()
+        }
+    if isinstance(payload.get("status"), dict):
+        device["status"] = {
+            str(key)[:40]: value
+            for key, value in payload["status"].items()
+            if isinstance(value, (str, int, float, bool)) or value is None
+        }
+
+    return public_device(device_id)
+
+
 def update_device_result(device_id: str, response: dict[str, Any]) -> None:
     device = DEVICES.setdefault(device_id, {
         "id": device_id,
@@ -202,6 +234,40 @@ def update_device_result(device_id: str, response: dict[str, Any]) -> None:
     device["last_command"] = response.get("command")
     device["last_transcript"] = response.get("transcript", "")
     device["last_display_text"] = response.get("display_text", "")
+
+
+def enqueue_device_event(device_id: str, event_type: str, display_text: str, tone: str = "success",
+                         source_device_id: str | None = None) -> dict[str, Any]:
+    event = {
+        "id": uuid.uuid4().hex,
+        "type": event_type,
+        "display_text": display_text,
+        "tone": tone,
+        "created_at": int(time.time()),
+    }
+    if source_device_id:
+        event["source_device_id"] = source_device_id
+    DEVICE_EVENTS.setdefault(device_id, []).append(event)
+    return event
+
+
+def pop_device_events(device_id: str, limit: int = 1) -> list[dict[str, Any]]:
+    events = DEVICE_EVENTS.get(device_id, [])
+    popped = events[:limit]
+    remaining = events[limit:]
+    if remaining:
+        DEVICE_EVENTS[device_id] = remaining
+    else:
+        DEVICE_EVENTS.pop(device_id, None)
+    return popped
+
+
+def event_payload_from_body(body: bytes) -> tuple[str, str, str]:
+    payload = json.loads(body.decode("utf-8"))
+    event_type = str(payload.get("type", "alert"))[:32]
+    display_text = str(payload.get("display_text", "Alert"))[:160]
+    tone = str(payload.get("tone", "alert"))[:24]
+    return event_type, display_text, tone
 
 
 def base_response(ok: bool, transcript: str, display_text: str, tone: str = "success", command: str | None = None,
@@ -412,6 +478,37 @@ def handle_timer(text: str, device_id: str, remainder: str) -> dict[str, Any]:
     return timer_response(text, device_id, duration_text)
 
 
+def handle_alert(text: str, device_id: str, remainder: str) -> dict[str, Any]:
+    normalized = normalize_command_text(f"{text} {remainder}")
+    message = "Alert"
+    target_ids: list[str]
+
+    if "all devices" in normalized or "everyone" in normalized or "broadcast" in normalized:
+        target_ids = sorted(DEVICES.keys())
+        if device_id not in target_ids:
+            target_ids.append(device_id)
+    else:
+        target_ids = [device_id]
+
+    if remainder:
+        cleaned = re.sub(r"\b(on|to)\s+all\s+devices\b", "", remainder, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"\ball\s+devices\b", "", cleaned, flags=re.IGNORECASE).strip()
+        if cleaned:
+            message = cleaned[:80]
+
+    for target_id in target_ids:
+        enqueue_device_event(target_id, "alert", message, "alert", source_device_id=device_id)
+
+    return apply_mute_state(device_id, base_response(
+        True,
+        text,
+        f"Alert sent to {len(target_ids)} device{'s' if len(target_ids) != 1 else ''}.",
+        "success",
+        command="alert",
+        state={"target_count": len(target_ids), "targets": target_ids},
+    ))
+
+
 COMMANDS: tuple[Command, ...] = (
     Command("mute", ("mute",), "Disable response tones for this device.", handle_mute),
     Command("unmute", ("unmute",), "Enable response tones for this device.", handle_unmute),
@@ -421,6 +518,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("cancel", ("cancel", "stop", "nevermind", "never mind"), "Cancel a pending command.", handle_cancel),
     Command("repeat", ("repeat", "say"), "Display the spoken suffix.", handle_repeat),
     Command("timer", ("timer", "set timer", "set a timer", "start timer", "start a timer"), "Set a timer.", handle_timer),
+    Command("alert", ("alert", "show alert", "show an alert", "send alert", "send an alert", "broadcast alert"), "Show an alert on one or more devices.", handle_alert),
 )
 
 
@@ -475,6 +573,13 @@ class CommandHandler(BaseHTTPRequestHandler):
                 devices = [public_device(device_id) for device_id in sorted(DEVICES)]
             json_response(self, 200, {"devices": devices})
             return
+        if parsed.path.startswith("/devices/") and parsed.path.endswith("/events"):
+            device_id = clean_device_id(parsed.path.removeprefix("/devices/").removesuffix("/events"))
+            with STATE_LOCK:
+                touch_device(device_id, self)
+                events = pop_device_events(device_id)
+            json_response(self, 200, {"device_id": device_id, "events": events})
+            return
         if parsed.path.startswith("/devices/"):
             device_id = clean_device_id(parsed.path.removeprefix("/devices/"))
             with STATE_LOCK:
@@ -502,6 +607,49 @@ class CommandHandler(BaseHTTPRequestHandler):
         json_response(self, 404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/devices/events":
+            try:
+                body = read_request_body(self)
+                event_type, display_text, tone = event_payload_from_body(body)
+                with STATE_LOCK:
+                    target_ids = sorted(DEVICES.keys())
+                    events = {
+                        device_id: enqueue_device_event(device_id, event_type, display_text, tone, source_device_id="server")
+                        for device_id in target_ids
+                    }
+                json_response(self, 200, {"ok": True, "target_count": len(target_ids), "targets": target_ids, "events": events})
+            except Exception as exc:
+                json_response(self, 400, {"ok": False, "error": str(exc)})
+            return
+
+        if parsed.path.startswith("/devices/") and parsed.path.endswith("/register"):
+            device_id = clean_device_id(parsed.path.removeprefix("/devices/").removesuffix("/register"))
+            try:
+                body = read_request_body(self)
+                payload = json.loads(body.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("registration body must be a JSON object")
+                with STATE_LOCK:
+                    device = register_device(device_id, payload, self)
+                json_response(self, 200, {"ok": True, "device": device})
+            except Exception as exc:
+                json_response(self, 400, {"ok": False, "error": str(exc)})
+            return
+
+        if parsed.path.startswith("/devices/") and parsed.path.endswith("/events"):
+            device_id = clean_device_id(parsed.path.removeprefix("/devices/").removesuffix("/events"))
+            try:
+                body = read_request_body(self)
+                event_type, display_text, tone = event_payload_from_body(body)
+                with STATE_LOCK:
+                    touch_device(device_id, self)
+                    event = enqueue_device_event(device_id, event_type, display_text, tone, source_device_id="server")
+                json_response(self, 200, {"ok": True, "device_id": device_id, "event": event})
+            except Exception as exc:
+                json_response(self, 400, {"ok": False, "error": str(exc)})
+            return
+
         if self.path != "/audio/command":
             json_response(self, 404, {"error": "not found"})
             return

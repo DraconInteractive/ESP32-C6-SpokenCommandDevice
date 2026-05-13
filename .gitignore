@@ -10,6 +10,15 @@ firmware/managed_components/
 firmware/dependencies.lock
 firmware/sdkconfig
 firmware/sdkconfig.old
+display-firmware/build/
+display-firmware/managed_components/
+display-firmware/dependencies.lock
+display-firmware/sdkconfig
+display-firmware/sdkconfig.old
+camera-firmware/build/
+camera-firmware/managed_components/
+camera-firmware/sdkconfig
+camera-firmware/sdkconfig.old
 
 # Python generated files
 __pycache__/
