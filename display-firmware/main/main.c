@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -11,6 +12,7 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#include "jpeg_decoder.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -50,12 +52,21 @@ static const char *TAG = "display_node";
 #define EVENT_POLL_INTERVAL_US (5LL * 1000LL * 1000LL)
 #define ALERT_DISPLAY_TIME_US (5LL * 1000LL * 1000LL)
 #define HTTP_RESPONSE_MAX 1024
+#define JPEG_RESPONSE_MAX (64 * 1024)
 #define DISPLAY_TEXT_MAX 160
+#define TOUCH_HOLD_TIME_US (900LL * 1000LL)
+#define LCD_BLOCK_LINES 20
 
 typedef struct {
     char data[HTTP_RESPONSE_MAX];
     int length;
 } http_response_t;
+
+typedef struct {
+    uint8_t *data;
+    int length;
+    int capacity;
+} binary_response_t;
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_count;
@@ -64,12 +75,21 @@ static char s_device_id[48] = "waveshare-c3-display-unknown";
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static SemaphoreHandle_t s_color_done;
 static uint16_t s_line_buffer[LCD_H_RES];
+static uint16_t s_block_buffer[LCD_H_RES * LCD_BLOCK_LINES];
 static char s_display_text[DISPLAY_TEXT_MAX] = "Display ready.";
 
 static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
     uint16_t color = (uint16_t)(((b & 0xf8) << 8) | ((g & 0xfc) << 3) | (r >> 3));
     return (uint16_t)((color << 8) | (color >> 8));
+}
+
+static uint16_t standard_rgb565_to_panel(uint16_t color)
+{
+    uint8_t r = (uint8_t)(((color >> 11) & 0x1f) << 3);
+    uint8_t g = (uint8_t)(((color >> 5) & 0x3f) << 2);
+    uint8_t b = (uint8_t)((color & 0x1f) << 3);
+    return rgb565(r, g, b);
 }
 
 static uint64_t gpio_pin_mask(int pin)
@@ -88,6 +108,11 @@ static bool color_done_cb(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_e
 static esp_err_t lcd_cmd(uint8_t cmd, const void *data, size_t len)
 {
     return esp_lcd_panel_io_tx_param(s_lcd_io, cmd, data, len);
+}
+
+static esp_err_t lcd_cmd1(uint8_t cmd, uint8_t value)
+{
+    return lcd_cmd(cmd, &value, 1);
 }
 
 static esp_err_t lcd_set_window(int x0, int y0, int x1, int y1)
@@ -110,7 +135,7 @@ static esp_err_t lcd_write_color(int x0, int y0, int x1, int y1, const uint16_t 
     ESP_RETURN_ON_ERROR(lcd_set_window(x0, y0, x1, y1), TAG, "set draw window");
     xSemaphoreTake(s_color_done, 0);
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_color(s_lcd_io, 0x2c, color, bytes), TAG, "write color");
-    xSemaphoreTake(s_color_done, pdMS_TO_TICKS(1000));
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(s_color_done, pdMS_TO_TICKS(1000)) == pdTRUE, ESP_ERR_TIMEOUT, TAG, "wait color");
     return ESP_OK;
 }
 
@@ -123,11 +148,18 @@ static void fill_rect(int x0, int y0, int x1, int y1, uint16_t color)
     if (x1 <= x0 || y1 <= y0) {
         return;
     }
-    for (int x = 0; x < x1 - x0; ++x) {
-        s_line_buffer[x] = color;
+    int width = x1 - x0;
+    int pixels_per_block = width * LCD_BLOCK_LINES;
+    for (int i = 0; i < pixels_per_block; ++i) {
+        s_block_buffer[i] = color;
     }
-    for (int y = y0; y < y1; ++y) {
-        ESP_ERROR_CHECK(lcd_write_color(x0, y, x1, y + 1, s_line_buffer, (x1 - x0) * sizeof(uint16_t)));
+    for (int y = y0; y < y1;) {
+        int lines = y1 - y;
+        if (lines > LCD_BLOCK_LINES) {
+            lines = LCD_BLOCK_LINES;
+        }
+        ESP_ERROR_CHECK(lcd_write_color(x0, y, x1, y + lines, s_block_buffer, width * lines * sizeof(uint16_t)));
+        y += lines;
     }
 }
 
@@ -144,11 +176,11 @@ static void lcd_init(void)
     const esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_PIN_DC,
         .cs_gpio_num = LCD_PIN_CS,
-        .pclk_hz = 40 * 1000 * 1000,
+        .pclk_hz = 10 * 1000 * 1000,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
-        .trans_queue_depth = 4,
+        .trans_queue_depth = 1,
         .on_color_trans_done = color_done_cb,
         .user_ctx = NULL,
     };
@@ -183,16 +215,86 @@ static void lcd_init(void)
     cfg.user_ctx = s_color_done;
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &cfg, &s_lcd_io));
 
+    uint8_t madctl = 0x68;
+    uint8_t colmod = 0x05;
     ESP_ERROR_CHECK(lcd_cmd(0x01, NULL, 0));
-    vTaskDelay(pdMS_TO_TICKS(120));
-    ESP_ERROR_CHECK(lcd_cmd(0x11, NULL, 0));
-    vTaskDelay(pdMS_TO_TICKS(120));
-    uint8_t madctl = 0x00;
-    uint8_t colmod = 0x55;
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    ESP_ERROR_CHECK(lcd_cmd(0xef, NULL, 0));
+    uint8_t eb[] = {0x14};
+    ESP_ERROR_CHECK(lcd_cmd(0xeb, eb, sizeof(eb)));
+    ESP_ERROR_CHECK(lcd_cmd(0xfe, NULL, 0));
+    ESP_ERROR_CHECK(lcd_cmd(0xef, NULL, 0));
+    ESP_ERROR_CHECK(lcd_cmd(0xeb, eb, sizeof(eb)));
+    ESP_ERROR_CHECK(lcd_cmd1(0x84, 0x40));
+    ESP_ERROR_CHECK(lcd_cmd1(0x85, 0xff));
+    ESP_ERROR_CHECK(lcd_cmd1(0x86, 0xff));
+    ESP_ERROR_CHECK(lcd_cmd1(0x87, 0xff));
+    ESP_ERROR_CHECK(lcd_cmd1(0x88, 0x0a));
+    ESP_ERROR_CHECK(lcd_cmd1(0x89, 0x21));
+    ESP_ERROR_CHECK(lcd_cmd1(0x8a, 0x00));
+    ESP_ERROR_CHECK(lcd_cmd1(0x8b, 0x80));
+    ESP_ERROR_CHECK(lcd_cmd1(0x8c, 0x01));
+    ESP_ERROR_CHECK(lcd_cmd1(0x8d, 0x01));
+    ESP_ERROR_CHECK(lcd_cmd1(0x8e, 0xff));
+    ESP_ERROR_CHECK(lcd_cmd1(0x8f, 0xff));
+    uint8_t b6[] = {0x00, 0x20};
+    ESP_ERROR_CHECK(lcd_cmd(0xb6, b6, sizeof(b6)));
     ESP_ERROR_CHECK(lcd_cmd(0x36, &madctl, 1));
     ESP_ERROR_CHECK(lcd_cmd(0x3a, &colmod, 1));
+    uint8_t cmd90[] = {0x08, 0x08, 0x08, 0x08};
+    ESP_ERROR_CHECK(lcd_cmd(0x90, cmd90, sizeof(cmd90)));
+    ESP_ERROR_CHECK(lcd_cmd1(0xbd, 0x06));
+    ESP_ERROR_CHECK(lcd_cmd1(0xbc, 0x00));
+    uint8_t ff[] = {0x60, 0x01, 0x04};
+    ESP_ERROR_CHECK(lcd_cmd(0xff, ff, sizeof(ff)));
+    uint8_t c3[] = {0x13};
+    uint8_t c4[] = {0x13};
+    uint8_t c9[] = {0x22};
+    uint8_t be[] = {0x11};
+    uint8_t e1[] = {0x10, 0x0e};
+    uint8_t df[] = {0x21, 0x0c, 0x02};
+    uint8_t f0[] = {0x45, 0x09, 0x08, 0x08, 0x26, 0x2a};
+    uint8_t f1[] = {0x43, 0x70, 0x72, 0x36, 0x37, 0x6f};
+    uint8_t f2[] = {0x45, 0x09, 0x08, 0x08, 0x26, 0x2a};
+    uint8_t f3[] = {0x43, 0x70, 0x72, 0x36, 0x37, 0x6f};
+    ESP_ERROR_CHECK(lcd_cmd(0xc3, c3, sizeof(c3)));
+    ESP_ERROR_CHECK(lcd_cmd(0xc4, c4, sizeof(c4)));
+    ESP_ERROR_CHECK(lcd_cmd(0xc9, c9, sizeof(c9)));
+    ESP_ERROR_CHECK(lcd_cmd(0xbe, be, sizeof(be)));
+    ESP_ERROR_CHECK(lcd_cmd(0xe1, e1, sizeof(e1)));
+    ESP_ERROR_CHECK(lcd_cmd(0xdf, df, sizeof(df)));
+    ESP_ERROR_CHECK(lcd_cmd(0xf0, f0, sizeof(f0)));
+    ESP_ERROR_CHECK(lcd_cmd(0xf1, f1, sizeof(f1)));
+    ESP_ERROR_CHECK(lcd_cmd(0xf2, f2, sizeof(f2)));
+    ESP_ERROR_CHECK(lcd_cmd(0xf3, f3, sizeof(f3)));
+    uint8_t ed[] = {0x1b, 0x0b};
+    uint8_t cmd70[] = {0x07, 0x07, 0x04, 0x0e, 0x0f, 0x09, 0x07, 0x08, 0x03};
+    uint8_t cmd62[] = {0x18, 0x0d, 0x71, 0xed, 0x70, 0x70, 0x18, 0x0f, 0x71, 0xef, 0x70, 0x70};
+    uint8_t cmd63[] = {0x18, 0x11, 0x71, 0xf1, 0x70, 0x70, 0x18, 0x13, 0x71, 0xf3, 0x70, 0x70};
+    uint8_t cmd64[] = {0x28, 0x29, 0xf1, 0x01, 0xf1, 0x00, 0x07};
+    uint8_t cmd66[] = {0x3c, 0x00, 0xcd, 0x67, 0x45, 0x45, 0x10, 0x00, 0x00, 0x00};
+    uint8_t cmd67[] = {0x00, 0x3c, 0x00, 0x00, 0x00, 0x01, 0x54, 0x10, 0x32, 0x98};
+    uint8_t cmd74[] = {0x10, 0x85, 0x80, 0x00, 0x00, 0x4e, 0x00};
+    uint8_t cmd98[] = {0x3e, 0x07};
+    ESP_ERROR_CHECK(lcd_cmd(0xed, ed, sizeof(ed)));
+    ESP_ERROR_CHECK(lcd_cmd1(0xae, 0x77));
+    ESP_ERROR_CHECK(lcd_cmd1(0xcd, 0x63));
+    ESP_ERROR_CHECK(lcd_cmd(0x70, cmd70, sizeof(cmd70)));
+    ESP_ERROR_CHECK(lcd_cmd1(0xe8, 0x34));
+    ESP_ERROR_CHECK(lcd_cmd(0x62, cmd62, sizeof(cmd62)));
+    ESP_ERROR_CHECK(lcd_cmd(0x63, cmd63, sizeof(cmd63)));
+    ESP_ERROR_CHECK(lcd_cmd(0x64, cmd64, sizeof(cmd64)));
+    ESP_ERROR_CHECK(lcd_cmd(0x66, cmd66, sizeof(cmd66)));
+    ESP_ERROR_CHECK(lcd_cmd(0x67, cmd67, sizeof(cmd67)));
+    ESP_ERROR_CHECK(lcd_cmd(0x74, cmd74, sizeof(cmd74)));
+    ESP_ERROR_CHECK(lcd_cmd(0x98, cmd98, sizeof(cmd98)));
+    ESP_ERROR_CHECK(lcd_cmd(0x35, NULL, 0));
     ESP_ERROR_CHECK(lcd_cmd(0x21, NULL, 0));
+    ESP_ERROR_CHECK(lcd_cmd(0x11, NULL, 0));
+    vTaskDelay(pdMS_TO_TICKS(120));
     ESP_ERROR_CHECK(lcd_cmd(0x29, NULL, 0));
+    vTaskDelay(pdMS_TO_TICKS(20));
     if (LCD_PIN_BL >= 0) {
         gpio_set_level(LCD_PIN_BL, 1);
     }
@@ -221,6 +323,21 @@ static void i2c_init(void)
 static bool touch_pressed(void)
 {
     return gpio_get_level(TOUCH_PIN_INT) == 0;
+}
+
+static bool touch_held(void)
+{
+    if (!touch_pressed()) {
+        return false;
+    }
+    int64_t started = esp_timer_get_time();
+    while (esp_timer_get_time() - started < TOUCH_HOLD_TIME_US) {
+        if (!touch_pressed()) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+    return true;
 }
 
 static const uint8_t *glyph(char c)
@@ -374,6 +491,164 @@ static void render_alert(const char *text)
     render_home();
 }
 
+static esp_err_t binary_http_event_handler(esp_http_client_event_t *evt)
+{
+    binary_response_t *response = (binary_response_t *)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && response != NULL && evt->data_len > 0) {
+        if (response->length + evt->data_len > response->capacity) {
+            ESP_LOGW(TAG, "HTTP binary response too large");
+            return ESP_FAIL;
+        }
+        memcpy(response->data + response->length, evt->data, evt->data_len);
+        response->length += evt->data_len;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t fetch_jpeg(const char *url, uint8_t **jpeg, int *jpeg_len)
+{
+    binary_response_t response = {
+        .data = malloc(JPEG_RESPONSE_MAX),
+        .capacity = JPEG_RESPONSE_MAX,
+    };
+    ESP_RETURN_ON_FALSE(response.data != NULL, ESP_ERR_NO_MEM, TAG, "allocate JPEG buffer");
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = 8000,
+        .event_handler = binary_http_event_handler,
+        .user_data = &response,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        free(response.data);
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (ret != ESP_OK || status < 200 || status >= 300 || response.length <= 0) {
+        ESP_LOGW(TAG, "JPEG fetch failed: err=%s status=%d len=%d", esp_err_to_name(ret), status, response.length);
+        free(response.data);
+        return ESP_FAIL;
+    }
+
+    *jpeg = response.data;
+    *jpeg_len = response.length;
+    return ESP_OK;
+}
+
+static esp_err_t decode_jpeg_rgb565(uint8_t *jpeg, int jpeg_len, uint16_t **pixels, esp_jpeg_image_output_t *image)
+{
+    esp_jpeg_image_cfg_t info_cfg = {
+        .indata = jpeg,
+        .indata_size = jpeg_len,
+        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale = JPEG_IMAGE_SCALE_0,
+    };
+    ESP_RETURN_ON_ERROR(esp_jpeg_get_image_info(&info_cfg, image), TAG, "read JPEG info");
+
+    *pixels = malloc(image->output_len);
+    ESP_RETURN_ON_FALSE(*pixels != NULL, ESP_ERR_NO_MEM, TAG, "allocate decoded JPEG buffer");
+
+    esp_jpeg_image_cfg_t decode_cfg = {
+        .indata = jpeg,
+        .indata_size = jpeg_len,
+        .outbuf = (uint8_t *)(*pixels),
+        .outbuf_size = image->output_len,
+        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale = JPEG_IMAGE_SCALE_0,
+        .flags = {
+            .swap_color_bytes = 0,
+        },
+    };
+    esp_err_t ret = esp_jpeg_decode(&decode_cfg, image);
+    if (ret != ESP_OK) {
+        free(*pixels);
+        *pixels = NULL;
+    }
+    return ret;
+}
+
+static void draw_camera_frame(const uint16_t *pixels, int src_w, int src_h)
+{
+    const uint16_t bg = rgb565(0, 0, 0);
+    fill_rect(0, 0, LCD_H_RES, LCD_V_RES, bg);
+
+    int scale_num_w = src_w;
+    int scale_num_h = src_h;
+    int scale_den = LCD_H_RES;
+    if (src_h * LCD_H_RES < src_w * LCD_V_RES) {
+        scale_den = LCD_V_RES;
+    }
+
+    for (int y = 0; y < LCD_V_RES; ++y) {
+        int src_y = ((y - LCD_V_RES / 2) * scale_num_h) / scale_den + src_h / 2;
+        if (src_y < 0 || src_y >= src_h) {
+            continue;
+        }
+        for (int x = 0; x < LCD_H_RES; ++x) {
+            int dx = x - LCD_H_RES / 2;
+            int dy = y - LCD_V_RES / 2;
+            if (dx * dx + dy * dy > (LCD_H_RES / 2) * (LCD_H_RES / 2)) {
+                s_line_buffer[x] = bg;
+                continue;
+            }
+            int src_x = (dx * scale_num_w) / scale_den + src_w / 2;
+            if (src_x < 0 || src_x >= src_w) {
+                s_line_buffer[x] = bg;
+            } else {
+                s_line_buffer[x] = standard_rgb565_to_panel(pixels[src_y * src_w + src_x]);
+            }
+        }
+        ESP_ERROR_CHECK(lcd_write_color(0, y, LCD_H_RES, y + 1, s_line_buffer, LCD_H_RES * sizeof(uint16_t)));
+    }
+}
+
+static void render_camera_view(const char *capture_url)
+{
+    const uint16_t bg = rgb565(6, 10, 14);
+    const uint16_t fg = rgb565(218, 232, 226);
+    if (!capture_url || capture_url[0] == '\0') {
+        strlcpy(s_display_text, "No camera URL.", sizeof(s_display_text));
+        render_home();
+        return;
+    }
+
+    fill_rect(0, 0, LCD_H_RES, LCD_V_RES, bg);
+    draw_text_centered(106, 172, 2, "Loading camera", fg, bg, 1);
+
+    uint8_t *jpeg = NULL;
+    int jpeg_len = 0;
+    uint16_t *pixels = NULL;
+    esp_jpeg_image_output_t image = {0};
+    esp_err_t ret = fetch_jpeg(capture_url, &jpeg, &jpeg_len);
+    if (ret == ESP_OK) {
+        ret = decode_jpeg_rgb565(jpeg, jpeg_len, &pixels, &image);
+    }
+    if (jpeg) {
+        free(jpeg);
+    }
+
+    if (ret != ESP_OK || pixels == NULL) {
+        ESP_LOGW(TAG, "Camera view failed: %s", esp_err_to_name(ret));
+        strlcpy(s_display_text, "Camera failed.", sizeof(s_display_text));
+        render_home();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Camera frame decoded: %ux%u", image.width, image.height);
+    draw_camera_frame(pixels, image.width, image.height);
+    free(pixels);
+
+    while (!touch_held()) {
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+    strlcpy(s_display_text, "Display ready.", sizeof(s_display_text));
+    render_home();
+}
+
 static void init_device_id(void)
 {
     uint8_t mac[6] = {0};
@@ -497,11 +772,15 @@ static void poll_events(void)
 
     char type[24] = {0};
     char display_text[DISPLAY_TEXT_MAX] = {0};
+    char capture_url[192] = {0};
     extract_json_string(response.data, "type", type, sizeof(type));
     extract_json_string(response.data, "display_text", display_text, sizeof(display_text));
+    extract_json_string(response.data, "capture_url", capture_url, sizeof(capture_url));
     ESP_LOGI(TAG, "Event type=%s display=%s", type, display_text);
     if (strcmp(type, "alert") == 0) {
         render_alert(display_text);
+    } else if (strcmp(type, "camera_view") == 0) {
+        render_camera_view(capture_url);
     }
 }
 
