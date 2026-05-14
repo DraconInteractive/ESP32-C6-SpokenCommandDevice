@@ -45,6 +45,7 @@ static const char *TAG = "display_node";
 #define TOUCH_PIN_INT GPIO_NUM_0
 #define I2C_PIN_SDA GPIO_NUM_4
 #define I2C_PIN_SCL GPIO_NUM_5
+#define CST816_ADDR 0x15
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
@@ -320,19 +321,35 @@ static void i2c_init(void)
     ESP_ERROR_CHECK(gpio_config(&touch_int));
 }
 
-static bool touch_pressed(void)
+static bool touch_active(void)
 {
+    uint8_t reg = 0x01;
+    uint8_t data[6] = {0};
+    esp_err_t ret = i2c_master_write_read_device(
+        I2C_PORT,
+        CST816_ADDR,
+        &reg,
+        1,
+        data,
+        sizeof(data),
+        pdMS_TO_TICKS(20));
+    if (ret == ESP_OK && (data[1] & 0x0f) > 0) {
+        return true;
+    }
     return gpio_get_level(TOUCH_PIN_INT) == 0;
 }
 
 static bool touch_held(void)
 {
-    if (!touch_pressed()) {
+    if (!touch_active()) {
         return false;
     }
     int64_t started = esp_timer_get_time();
+    int64_t last_active = started;
     while (esp_timer_get_time() - started < TOUCH_HOLD_TIME_US) {
-        if (!touch_pressed()) {
+        if (touch_active()) {
+            last_active = esp_timer_get_time();
+        } else if (esp_timer_get_time() - last_active > 250LL * 1000LL) {
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(40));
@@ -483,7 +500,7 @@ static void render_alert(const char *text)
     draw_alert_icon();
     draw_text_centered(136, 172, 5, s_display_text, fg, bg, 1);
     while (esp_timer_get_time() < until) {
-        if (touch_pressed()) {
+        if (touch_active()) {
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -541,11 +558,12 @@ static esp_err_t fetch_jpeg(const char *url, uint8_t **jpeg, int *jpeg_len)
 
 static esp_err_t decode_jpeg_rgb565(uint8_t *jpeg, int jpeg_len, uint16_t **pixels, esp_jpeg_image_output_t *image)
 {
+    const esp_jpeg_image_scale_t scale = JPEG_IMAGE_SCALE_1_2;
     esp_jpeg_image_cfg_t info_cfg = {
         .indata = jpeg,
         .indata_size = jpeg_len,
         .out_format = JPEG_IMAGE_FORMAT_RGB565,
-        .out_scale = JPEG_IMAGE_SCALE_0,
+        .out_scale = scale,
     };
     ESP_RETURN_ON_ERROR(esp_jpeg_get_image_info(&info_cfg, image), TAG, "read JPEG info");
 
@@ -558,7 +576,7 @@ static esp_err_t decode_jpeg_rgb565(uint8_t *jpeg, int jpeg_len, uint16_t **pixe
         .outbuf = (uint8_t *)(*pixels),
         .outbuf_size = image->output_len,
         .out_format = JPEG_IMAGE_FORMAT_RGB565,
-        .out_scale = JPEG_IMAGE_SCALE_0,
+        .out_scale = scale,
         .flags = {
             .swap_color_bytes = 0,
         },
@@ -645,6 +663,7 @@ static void render_camera_view(const char *capture_url)
     while (!touch_held()) {
         vTaskDelay(pdMS_TO_TICKS(80));
     }
+    ESP_LOGI(TAG, "Camera view cleared by touch hold");
     strlcpy(s_display_text, "Display ready.", sizeof(s_display_text));
     render_home();
 }
