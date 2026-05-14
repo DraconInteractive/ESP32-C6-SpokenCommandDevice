@@ -27,6 +27,21 @@ http://<device-ip>/capture
 http://<device-ip>/stream
 ```
 
+The device also advertises itself with mDNS using its stable device id as the
+hostname, so it can be found without serial output:
+
+```text
+http://timercam-x-<wifi-mac-suffix>.local/
+http://timercam-x-<wifi-mac-suffix>.local/capture
+http://timercam-x-<wifi-mac-suffix>.local/stream
+```
+
+On Linux, discovery can be checked with Avahi if installed:
+
+```bash
+avahi-browse -rt _http._tcp
+```
+
 The firmware also registers with the command server as:
 
 ```text

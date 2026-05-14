@@ -14,6 +14,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "mdns.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "sdkconfig.h"
@@ -183,6 +184,31 @@ static void register_with_command_server(void)
     } else {
         ESP_LOGW(TAG, "Command server registration failed: err=%s status=%d", esp_err_to_name(err), status);
     }
+}
+
+static void start_mdns_service(void)
+{
+    char instance[80] = {0};
+    snprintf(instance, sizeof(instance), "TimerCamera-X %s", device_id);
+
+    mdns_txt_item_t txt[] = {
+        {"device_id", device_id},
+        {"type", "camera"},
+        {"model", "M5Stack TimerCamera-X"},
+        {"capture", "/capture"},
+        {"stream", "/stream"},
+    };
+
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(mdns_hostname_set(device_id));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(mdns_instance_name_set(instance));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(mdns_service_add(instance, "_http", "_tcp", 80, txt, sizeof(txt) / sizeof(txt[0])));
+    ESP_LOGI(TAG, "mDNS advertised: http://%s.local/", device_id);
 }
 
 static void registration_task(void *arg)
@@ -503,6 +529,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Connected. Camera URL: http://%s/", current_ip);
     ESP_ERROR_CHECK(camera_init());
     start_http_server(false);
+    start_mdns_service();
     register_with_command_server();
     xTaskCreate(registration_task, "registration", 4096, NULL, 5, NULL);
 }
