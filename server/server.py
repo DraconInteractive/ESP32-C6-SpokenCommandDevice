@@ -236,6 +236,43 @@ def update_device_result(device_id: str, response: dict[str, Any]) -> None:
     device["last_display_text"] = response.get("display_text", "")
 
 
+def device_ip(device: dict[str, Any]) -> str:
+    status = device.get("status", {})
+    if isinstance(status, dict) and status.get("ip"):
+        return str(status["ip"])
+    if device.get("remote_addr"):
+        return str(device["remote_addr"])
+    endpoints = device.get("endpoints", {})
+    if isinstance(endpoints, dict):
+        for value in endpoints.values():
+            parsed = urlparse(str(value))
+            if parsed.hostname:
+                return parsed.hostname
+    return "unknown"
+
+
+def device_display_name(device_id: str, device: dict[str, Any]) -> str:
+    model = str(device.get("model", "")).strip()
+    if model:
+        return model
+    device_type = str(device.get("type", "")).strip()
+    if device_type and device_type != "unknown":
+        return f"{device_type} {device_id}"
+    return device_id
+
+
+def status_devices() -> list[dict[str, str]]:
+    return [
+        {
+            "id": device_id,
+            "name": device_display_name(device_id, DEVICES[device_id]),
+            "type": str(DEVICES[device_id].get("type", "unknown")),
+            "ip": device_ip(DEVICES[device_id]),
+        }
+        for device_id in sorted(DEVICES)
+    ]
+
+
 def enqueue_device_event(device_id: str, event_type: str, display_text: str, tone: str = "success",
                          source_device_id: str | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     event = {
@@ -430,17 +467,29 @@ def handle_help(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
 def handle_status(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
     muted = MUTED_DEVICES.get(device_id, False)
     pending = PENDING_ACTIONS.get(device_id)
+    devices = status_devices()
     status = "Server online. "
     status += "Muted." if muted else "Sound on."
     if pending:
         status += f" Awaiting {pending.get('slot', 'input')}."
+    if devices:
+        compact_devices = [
+            f"{device['name']}: {device['ip']}"
+            for device in devices[:3]
+        ]
+        status += " Devices: " + "; ".join(compact_devices)
+        if len(devices) > 3:
+            status += f"; +{len(devices) - 3} more"
+        status += "."
+    else:
+        status += " No devices registered."
     return apply_mute_state(device_id, base_response(
         True,
         text,
         status,
         "success",
         command="status",
-        state={"muted": muted, "pending": pending is not None},
+        state={"muted": muted, "pending": pending is not None, "devices": devices},
     ))
 
 
