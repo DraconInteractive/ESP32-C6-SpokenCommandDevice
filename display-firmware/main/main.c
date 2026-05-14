@@ -57,6 +57,7 @@ static const char *TAG = "display_node";
 #define DISPLAY_TEXT_MAX 160
 #define TOUCH_HOLD_TIME_US (900LL * 1000LL)
 #define LCD_BLOCK_LINES 20
+#define CAMERA_FRAME_INTERVAL_US (1000LL * 1000LL)
 
 typedef struct {
     char data[HTTP_RESPONSE_MAX];
@@ -592,8 +593,6 @@ static esp_err_t decode_jpeg_rgb565(uint8_t *jpeg, int jpeg_len, uint16_t **pixe
 static void draw_camera_frame(const uint16_t *pixels, int src_w, int src_h)
 {
     const uint16_t bg = rgb565(0, 0, 0);
-    fill_rect(0, 0, LCD_H_RES, LCD_V_RES, bg);
-
     int scale_num_w = src_w;
     int scale_num_h = src_h;
     int scale_den = LCD_H_RES;
@@ -624,19 +623,8 @@ static void draw_camera_frame(const uint16_t *pixels, int src_w, int src_h)
     }
 }
 
-static void render_camera_view(const char *capture_url)
+static esp_err_t fetch_and_draw_camera_frame(const char *capture_url, uint32_t frame_number)
 {
-    const uint16_t bg = rgb565(6, 10, 14);
-    const uint16_t fg = rgb565(218, 232, 226);
-    if (!capture_url || capture_url[0] == '\0') {
-        strlcpy(s_display_text, "No camera URL.", sizeof(s_display_text));
-        render_home();
-        return;
-    }
-
-    fill_rect(0, 0, LCD_H_RES, LCD_V_RES, bg);
-    draw_text_centered(106, 172, 2, "Loading camera", fg, bg, 1);
-
     uint8_t *jpeg = NULL;
     int jpeg_len = 0;
     uint16_t *pixels = NULL;
@@ -651,18 +639,55 @@ static void render_camera_view(const char *capture_url)
 
     if (ret != ESP_OK || pixels == NULL) {
         ESP_LOGW(TAG, "Camera view failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Camera frame %" PRIu32 " decoded: %ux%u", frame_number, image.width, image.height);
+    draw_camera_frame(pixels, image.width, image.height);
+    free(pixels);
+    return ESP_OK;
+}
+
+static void render_camera_view(const char *capture_url)
+{
+    const uint16_t bg = rgb565(6, 10, 14);
+    const uint16_t fg = rgb565(218, 232, 226);
+    if (!capture_url || capture_url[0] == '\0') {
+        strlcpy(s_display_text, "No camera URL.", sizeof(s_display_text));
+        render_home();
+        return;
+    }
+
+    fill_rect(0, 0, LCD_H_RES, LCD_V_RES, bg);
+    draw_text_centered(106, 172, 2, "Loading camera", fg, bg, 1);
+
+    uint32_t frame_number = 0;
+    int consecutive_failures = 0;
+    int64_t next_frame_at = 0;
+    while (!touch_held()) {
+        int64_t now = esp_timer_get_time();
+        if (now >= next_frame_at) {
+            esp_err_t ret = fetch_and_draw_camera_frame(capture_url, frame_number + 1);
+            if (ret == ESP_OK) {
+                frame_number++;
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures++;
+                if (frame_number == 0 || consecutive_failures >= 3) {
+                    break;
+                }
+            }
+            next_frame_at = esp_timer_get_time() + CAMERA_FRAME_INTERVAL_US;
+        }
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
+    if (frame_number == 0 || consecutive_failures >= 3) {
         strlcpy(s_display_text, "Camera failed.", sizeof(s_display_text));
         render_home();
         return;
     }
 
-    ESP_LOGI(TAG, "Camera frame decoded: %ux%u", image.width, image.height);
-    draw_camera_frame(pixels, image.width, image.height);
-    free(pixels);
-
-    while (!touch_held()) {
-        vTaskDelay(pdMS_TO_TICKS(80));
-    }
     ESP_LOGI(TAG, "Camera view cleared by touch hold");
     strlcpy(s_display_text, "Display ready.", sizeof(s_display_text));
     render_home();
