@@ -29,6 +29,8 @@ PORT = int(os.environ.get("COMMAND_SERVER_PORT", "8080"))
 ELEVENLABS_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 MODEL_ID = os.environ.get("ELEVENLABS_MODEL_ID", "scribe_v2")
 MAX_AUDIO_BYTES = int(os.environ.get("COMMAND_SERVER_MAX_AUDIO_BYTES", str(4 * 1024 * 1024)))
+DEVICE_STALE_SECONDS = int(os.environ.get("COMMAND_SERVER_DEVICE_STALE_SECONDS", "45"))
+DEVICE_PING_TIMEOUT_SECONDS = float(os.environ.get("COMMAND_SERVER_DEVICE_PING_TIMEOUT_SECONDS", "2.0"))
 
 RECENT_COMMANDS: list[dict[str, Any]] = []
 MUTED_DEVICES: dict[str, bool] = {}
@@ -273,6 +275,64 @@ def status_devices() -> list[dict[str, str]]:
     ]
 
 
+def device_ping_url(device: dict[str, Any]) -> str | None:
+    endpoints = device.get("endpoints", {})
+    if isinstance(endpoints, dict):
+        for key in ("root", "health", "capture", "stream"):
+            value = endpoints.get(key)
+            if value:
+                return str(value)
+        for value in endpoints.values():
+            if value:
+                return str(value)
+    return None
+
+
+def http_device_online(url: str) -> tuple[bool, str]:
+    try:
+        request = Request(url, method="GET", headers={"User-Agent": "SpokenCommandServer/0.1"})
+        with urlopen(request, timeout=DEVICE_PING_TIMEOUT_SECONDS) as response:
+            return response.status < 500, f"http {response.status}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def recent_device_online(device: dict[str, Any]) -> tuple[bool, str]:
+    last_seen = device.get("last_seen")
+    if not isinstance(last_seen, (int, float)):
+        return False, "never seen"
+    age = max(0, int(time.time() - last_seen))
+    if age <= DEVICE_STALE_SECONDS:
+        return True, f"seen {age}s ago"
+    return False, f"stale {age}s"
+
+
+def ping_device(device_id: str, device: dict[str, Any]) -> dict[str, Any]:
+    url = device_ping_url(device)
+    if url:
+        online, detail = http_device_online(url)
+        method = "http"
+    else:
+        online, detail = recent_device_online(device)
+        method = "last_seen"
+    return {
+        "id": device_id,
+        "name": device_display_name(device_id, device),
+        "type": str(device.get("type", "unknown")),
+        "ip": device_ip(device),
+        "online": online,
+        "method": method,
+        "detail": detail,
+    }
+
+
+def remove_device(device_id: str) -> None:
+    DEVICES.pop(device_id, None)
+    DEVICE_EVENTS.pop(device_id, None)
+    MUTED_DEVICES.pop(device_id, None)
+    PENDING_ACTIONS.pop(device_id, None)
+
+
 def enqueue_device_event(device_id: str, event_type: str, display_text: str, tone: str = "success",
                          source_device_id: str | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     event = {
@@ -493,6 +553,37 @@ def handle_status(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
     ))
 
 
+def handle_ping(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+    results = [
+        ping_device(candidate_id, dict(DEVICES[candidate_id]))
+        for candidate_id in sorted(DEVICES)
+    ]
+    removed = [result for result in results if not result["online"]]
+    for result in removed:
+        remove_device(result["id"])
+
+    online_count = len(results) - len(removed)
+    if results:
+        display_text = f"Ping complete. {online_count} online, {len(removed)} removed."
+    else:
+        display_text = "Ping complete. No devices registered."
+
+    return apply_mute_state(device_id, base_response(
+        True,
+        text,
+        display_text,
+        "success" if not removed else "error",
+        command="ping",
+        state={
+            "online_count": online_count,
+            "removed_count": len(removed),
+            "results": results,
+            "removed": removed,
+            "devices": status_devices(),
+        },
+    ))
+
+
 def handle_cancel(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
     had_pending = device_id in PENDING_ACTIONS
     PENDING_ACTIONS.pop(device_id, None)
@@ -630,7 +721,8 @@ def handle_camera_view(text: str, device_id: str, _remainder: str) -> dict[str, 
 COMMANDS: tuple[Command, ...] = (
     Command("mute", ("mute",), "Disable response tones for this device.", handle_mute),
     Command("unmute", ("unmute",), "Enable response tones for this device.", handle_unmute),
-    Command("test", ("test", "ping"), "Check that the command server is ready.", handle_test),
+    Command("test", ("test",), "Check that the command server is ready.", handle_test),
+    Command("ping", ("ping", "ping devices", "check devices", "check all devices"), "Check known devices and remove offline entries.", handle_ping),
     Command("help", ("help", "commands", "what can you do"), "Show available commands.", handle_help),
     Command("status", ("status", "server status"), "Show server/device state.", handle_status),
     Command("cancel", ("cancel", "stop", "nevermind", "never mind"), "Cancel a pending command.", handle_cancel),
@@ -661,7 +753,7 @@ def command_response(transcript_text: str, device_id: str = "unknown") -> dict[s
         if not text:
             return apply_mute_state(device_id, base_response(False, "", "No speech heard.", "error"))
 
-        if normalized in {"mute", "unmute", "status", "server status", "help", "commands", "what can you do", "cancel", "stop", "nevermind", "never mind"}:
+        if normalized in {"mute", "unmute", "status", "server status", "ping", "ping devices", "check devices", "check all devices", "help", "commands", "what can you do", "cancel", "stop", "nevermind", "never mind"}:
             command = dispatch_command(text, device_id)
             if command is not None:
                 return command
