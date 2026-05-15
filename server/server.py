@@ -34,6 +34,7 @@ DEVICE_PING_TIMEOUT_SECONDS = float(os.environ.get("COMMAND_SERVER_DEVICE_PING_T
 
 RECENT_COMMANDS: list[dict[str, Any]] = []
 MUTED_DEVICES: dict[str, bool] = {}
+GLOBAL_MUTED = False
 PENDING_ACTIONS: dict[str, dict[str, Any]] = {}
 DEVICES: dict[str, dict[str, Any]] = {}
 DEVICE_EVENTS: dict[str, list[dict[str, Any]]] = {}
@@ -392,7 +393,7 @@ def base_response(ok: bool, transcript: str, display_text: str, tone: str = "suc
 
 
 def apply_mute_state(device_id: str, response: dict[str, Any]) -> dict[str, Any]:
-    if MUTED_DEVICES.get(device_id, False):
+    if GLOBAL_MUTED or MUTED_DEVICES.get(device_id, False):
         response["tone"] = "none"
     return response
 
@@ -500,14 +501,23 @@ def handle_pending_action(device_id: str, text: str, normalized: str) -> dict[st
     return apply_mute_state(device_id, base_response(False, text, "I lost that request.", "error"))
 
 
-def handle_mute(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+def handle_mute(text: str, device_id: str, remainder: str) -> dict[str, Any]:
+    global GLOBAL_MUTED
+    if normalize_command_text(remainder) in {"all", "everyone", "everything"}:
+        GLOBAL_MUTED = True
+        return base_response(True, text, "All devices muted.", "none", command="mute_all", state={"global_muted": True})
     MUTED_DEVICES[device_id] = True
-    return base_response(True, text, "Muted.", "none", command="mute", state={"muted": True})
+    return base_response(True, text, "Muted.", "none", command="mute", state={"muted": True, "global_muted": GLOBAL_MUTED})
 
 
-def handle_unmute(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+def handle_unmute(text: str, device_id: str, remainder: str) -> dict[str, Any]:
+    global GLOBAL_MUTED
+    if normalize_command_text(remainder) in {"all", "everyone", "everything"}:
+        GLOBAL_MUTED = False
+        MUTED_DEVICES.clear()
+        return base_response(True, text, "All devices unmuted.", "success", command="unmute_all", state={"global_muted": False})
     MUTED_DEVICES[device_id] = False
-    return base_response(True, text, "Unmuted.", "success", command="unmute", state={"muted": False})
+    return base_response(True, text, "Unmuted.", "success", command="unmute", state={"muted": False, "global_muted": GLOBAL_MUTED})
 
 
 def handle_test(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
@@ -518,7 +528,7 @@ def handle_help(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
     return apply_mute_state(device_id, base_response(
         True,
         text,
-        "Commands: test, status, mute, timer.",
+        "Commands: test, status, list devices, ping, mute, broadcast, timer.",
         "success",
         command="help",
     ))
@@ -527,29 +537,43 @@ def handle_help(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
 def handle_status(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
     muted = MUTED_DEVICES.get(device_id, False)
     pending = PENDING_ACTIONS.get(device_id)
-    devices = status_devices()
     status = "Server online. "
-    status += "Muted." if muted else "Sound on."
+    if GLOBAL_MUTED:
+        status += "All devices muted."
+    else:
+        status += "Muted." if muted else "Sound on."
     if pending:
         status += f" Awaiting {pending.get('slot', 'input')}."
-    if devices:
-        compact_devices = [
-            f"{device['name']}: {device['ip']}"
-            for device in devices[:3]
-        ]
-        status += " Devices: " + "; ".join(compact_devices)
-        if len(devices) > 3:
-            status += f"; +{len(devices) - 3} more"
-        status += "."
-    else:
-        status += " No devices registered."
     return apply_mute_state(device_id, base_response(
         True,
         text,
         status,
         "success",
         command="status",
-        state={"muted": muted, "pending": pending is not None, "devices": devices},
+        state={"muted": muted, "global_muted": GLOBAL_MUTED, "pending": pending is not None},
+    ))
+
+
+def handle_list_devices(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
+    devices = status_devices()
+    if devices:
+        compact_devices = [
+            f"{device['name']}: {device['ip']}"
+            for device in devices[:4]
+        ]
+        display_text = "Devices: " + "; ".join(compact_devices)
+        if len(devices) > 4:
+            display_text += f"; +{len(devices) - 4} more"
+        display_text += "."
+    else:
+        display_text = "No devices registered."
+    return apply_mute_state(device_id, base_response(
+        True,
+        text,
+        display_text,
+        "success",
+        command="list_devices",
+        state={"devices": devices},
     ))
 
 
@@ -658,6 +682,39 @@ def handle_alert(text: str, device_id: str, remainder: str) -> dict[str, Any]:
     ))
 
 
+def event_capable_device_ids() -> list[str]:
+    return [
+        candidate_id
+        for candidate_id in sorted(DEVICES)
+        if not device_matches_type(candidate_id, DEVICES[candidate_id], "camera")
+    ]
+
+
+def handle_broadcast(text: str, device_id: str, remainder: str) -> dict[str, Any]:
+    message = remainder.strip()
+    if not message:
+        return apply_mute_state(device_id, base_response(
+            False,
+            text,
+            "What should I broadcast?",
+            "error",
+            command="broadcast",
+        ))
+
+    target_ids = event_capable_device_ids()
+    for target_id in target_ids:
+        enqueue_device_event(target_id, "alert", message[:160], "none", source_device_id=device_id)
+
+    return apply_mute_state(device_id, base_response(
+        True,
+        text,
+        f"Broadcast sent to {len(target_ids)} device{'s' if len(target_ids) != 1 else ''}.",
+        "success",
+        command="broadcast",
+        state={"target_count": len(target_ids), "targets": target_ids, "message": message[:160]},
+    ))
+
+
 def device_matches_type(device_id: str, device: dict[str, Any], wanted_type: str) -> bool:
     if device.get("type") == wanted_type:
         return True
@@ -725,10 +782,12 @@ COMMANDS: tuple[Command, ...] = (
     Command("ping", ("ping", "ping devices", "check devices", "check all devices"), "Check known devices and remove offline entries.", handle_ping),
     Command("help", ("help", "commands", "what can you do"), "Show available commands.", handle_help),
     Command("status", ("status", "server status"), "Show server/device state.", handle_status),
+    Command("list_devices", ("list devices", "devices", "device list", "show devices"), "Show known devices and IP addresses.", handle_list_devices),
     Command("cancel", ("cancel", "stop", "nevermind", "never mind"), "Cancel a pending command.", handle_cancel),
     Command("repeat", ("repeat", "say"), "Display the spoken suffix.", handle_repeat),
     Command("timer", ("timer", "set timer", "set a timer", "start timer", "start a timer"), "Set a timer.", handle_timer),
     Command("alert", ("alert", "show alert", "show an alert", "send alert", "send an alert", "broadcast alert"), "Show an alert on one or more devices.", handle_alert),
+    Command("broadcast", ("broadcast",), "Broadcast text to all known devices.", handle_broadcast),
     Command("camera_view", ("show camera", "show the camera", "show security cam", "show the security cam", "show security camera", "show the security camera", "display camera", "display the camera", "display security cam", "display the security cam", "display security camera", "display the security camera"), "Show a camera frame on a display.", handle_camera_view),
 )
 
@@ -753,7 +812,8 @@ def command_response(transcript_text: str, device_id: str = "unknown") -> dict[s
         if not text:
             return apply_mute_state(device_id, base_response(False, "", "No speech heard.", "error"))
 
-        if normalized in {"mute", "unmute", "status", "server status", "ping", "ping devices", "check devices", "check all devices", "help", "commands", "what can you do", "cancel", "stop", "nevermind", "never mind"}:
+        immediate_commands = {"mute", "mute all", "unmute", "unmute all", "status", "server status", "list devices", "devices", "device list", "show devices", "ping", "ping devices", "check devices", "check all devices", "help", "commands", "what can you do", "cancel", "stop", "nevermind", "never mind"}
+        if normalized in immediate_commands or normalized.startswith("broadcast "):
             command = dispatch_command(text, device_id)
             if command is not None:
                 return command
