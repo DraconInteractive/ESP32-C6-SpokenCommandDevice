@@ -557,14 +557,13 @@ def handle_status(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
 def handle_list_devices(text: str, device_id: str, _remainder: str) -> dict[str, Any]:
     devices = status_devices()
     if devices:
-        compact_devices = [
+        lines = [
             f"{device['name']}: {device['ip']}"
             for device in devices[:4]
         ]
-        display_text = "Devices: " + "; ".join(compact_devices)
+        display_text = "Devices:\n" + "\n".join(lines)
         if len(devices) > 4:
-            display_text += f"; +{len(devices) - 4} more"
-        display_text += "."
+            display_text += f"\n+{len(devices) - 4} more"
     else:
         display_text = "No devices registered."
     return apply_mute_state(device_id, base_response(

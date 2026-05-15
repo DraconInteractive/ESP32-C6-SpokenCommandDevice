@@ -1175,7 +1175,7 @@ static bool extract_json_string_field(const char *json, const char *field, char 
             cursor++;
             switch (*cursor) {
             case 'n':
-                out[written++] = ' ';
+                out[written++] = '\n';
                 break;
             case 'r':
             case 't':
